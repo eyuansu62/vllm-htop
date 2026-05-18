@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-htop"
+dynamic = ["version"]
+description = "htop-style terminal monitor for vLLM inference servers"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Bowen", email = "eyuansu71@gmail.com" },
+]
+keywords = [
+    "vllm",
+    "llm",
+    "inference",
+    "monitoring",
+    "observability",
+    "tui",
+    "prometheus",
+    "htop",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Monitoring",
+    "Topic :: Utilities",
+]
+# No runtime dependencies — uses stdlib only.
+dependencies = []
+
+[project.scripts]
+vllm-htop = "vllm_htop:main"
+
+[project.urls]
+Homepage = "https://github.com/eyuansu62/vllm-htop"
+Repository = "https://github.com/eyuansu62/vllm-htop"
+Issues = "https://github.com/eyuansu62/vllm-htop/issues"
+
+[tool.setuptools]
+py-modules = ["vllm_htop"]
+
+[tool.setuptools.dynamic]
+version = { attr = "vllm_htop.__version__" }
