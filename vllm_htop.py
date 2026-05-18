@@ -38,6 +38,7 @@ No third-party dependencies. Python 3.8+.
 
 import argparse
 import re
+import socket
 import sys
 import time
 import urllib.request
@@ -55,6 +56,12 @@ CYAN, GREEN, YELLOW, RED, GRAY = (
     "\033[36m", "\033[32m", "\033[33m", "\033[31m", "\033[90m",
 )
 CLEAR = "\033[2J\033[H"
+
+# ───────────────────────── trend / sparkline config ──────────────────────
+HISTORY_LEN = 60          # rolling samples kept per metric (≈2 min @ 2s interval)
+SPARK_WIDTH = 30          # characters per sparkline
+# 8 levels of vertical block. Space (idx 0) is reserved for "no data" padding.
+SPARK_BLOCKS = " ▁▂▃▄▅▆▇█"
 
 
 # ─────────────────────── which metrics we surface ────────────────────────
@@ -229,6 +236,13 @@ class Instance:
     peak_kv: float = 0.0          # percent (0-100)
     peak_prompt_rps: float = 0.0
     peak_gen_rps: float = 0.0
+    # Rolling history (most recent HISTORY_LEN samples) for trend sparklines
+    hist_running:    List[float] = field(default_factory=list)
+    hist_kv:         List[float] = field(default_factory=list)  # percent
+    hist_prompt_rps: List[float] = field(default_factory=list)
+    hist_gen_rps:    List[float] = field(default_factory=list)
+    hist_ttft_p95:   List[float] = field(default_factory=list)  # ms
+    hist_tpot_p95:   List[float] = field(default_factory=list)  # ms
 
 
 def fetch_metrics(url: str, timeout: float = 5.0) -> str:
@@ -274,6 +288,34 @@ def _update_session(inst: Instance) -> None:
                         setattr(inst, attr, rate)
 
 
+def _update_history(inst: Instance) -> None:
+    """Append the latest derived metrics to rolling per-metric histories.
+
+    Skips a metric for this tick if the value is unavailable (so the sparkline
+    doesn't pretend we saw a zero when really we had nothing).
+    """
+    smry = summarize(inst)
+    if smry is None:
+        return
+
+    def push(buf: List[float], v: Optional[float]) -> None:
+        if v is None:
+            return
+        buf.append(v)
+        if len(buf) > HISTORY_LEN:
+            del buf[0]
+
+    push(inst.hist_running, smry["running"])
+    push(inst.hist_kv,      smry["kv_pct"])
+    # Rates only exist on the 2nd+ poll
+    push(inst.hist_prompt_rps, smry["prompt_rps"])
+    push(inst.hist_gen_rps,    smry["gen_rps"])
+    if smry["ttft_p95"] is not None:
+        push(inst.hist_ttft_p95, smry["ttft_p95"] * 1000.0)
+    if smry["tpot_p95"] is not None:
+        push(inst.hist_tpot_p95, smry["tpot_p95"] * 1000.0)
+
+
 def fetch_one(inst: Instance, timeout: float) -> None:
     try:
         raw = fetch_metrics(inst.url, timeout=timeout)
@@ -281,6 +323,7 @@ def fetch_one(inst: Instance, timeout: float) -> None:
         inst.snapshot = parse_snapshot(raw)
         inst.error = None
         _update_session(inst)
+        _update_history(inst)
     except Exception as e:
         inst.error = f"{type(e).__name__}: {e}"
 
@@ -375,6 +418,34 @@ def fmt_duration(secs: Optional[float]) -> str:
     return f"{d}d{h:02d}h"
 
 
+def sparkline(values: List[float], width: int = SPARK_WIDTH,
+              fixed_min: Optional[float] = None,
+              fixed_max: Optional[float] = None) -> str:
+    """Render a sequence of values as a Unicode block-character sparkline.
+
+    Most recent value is on the right. If there are fewer samples than `width`,
+    the sparkline is left-padded with spaces so the right edge always shows the
+    latest reading.
+    """
+    if not values:
+        return " " * width
+    vals = values[-width:]
+    pad = max(0, width - len(vals))
+    lo = fixed_min if fixed_min is not None else min(vals)
+    hi = fixed_max if fixed_max is not None else max(vals)
+    span = hi - lo
+    if span < 1e-9:
+        # All samples equal — draw a flat mid-row so it's still visible.
+        return " " * pad + "▄" * len(vals)
+    out = []
+    # Indices 1..8 of SPARK_BLOCKS (skip 0 = space, reserved for padding).
+    for v in vals:
+        idx = 1 + int((v - lo) / span * 7.999)
+        idx = max(1, min(8, idx))
+        out.append(SPARK_BLOCKS[idx])
+    return " " * pad + "".join(out)
+
+
 def bar(pct: Optional[float], width: int = 22) -> str:
     if pct is None:
         return " " * width
@@ -455,6 +526,48 @@ def render_detail(inst: Instance) -> None:
         else:
             lines.append(f"  KV cache usage    :     —")
     lines.append("")
+
+    # ── Trend (sparklines over recent samples) ──
+    if inst.hist_running or inst.hist_kv:
+        n_samples = max(
+            len(inst.hist_running), len(inst.hist_kv),
+            len(inst.hist_prompt_rps), len(inst.hist_gen_rps),
+            len(inst.hist_ttft_p95), len(inst.hist_tpot_p95),
+        )
+        lines.append(f"{BOLD}▸ Trend{RESET}  "
+                     f"{DIM}(last {min(HISTORY_LEN, n_samples)} samples, newest on right){RESET}")
+
+        def trend_row(label: str, hist: List[float], val_fmt: str,
+                      fixed_min: Optional[float] = 0.0,
+                      fixed_max: Optional[float] = None,
+                      color_fn=None) -> str:
+            if not hist:
+                return f"  {label:<14}: {DIM}(no data yet){RESET}"
+            spark = sparkline(hist, fixed_min=fixed_min, fixed_max=fixed_max)
+            lo, hi, cur = min(hist), max(hist), hist[-1]
+            color = color_fn(cur) if color_fn else ""
+            stats = (f"{DIM}min{RESET}{val_fmt.format(lo)} "
+                     f"{DIM}max{RESET}{val_fmt.format(hi)} "
+                     f"{DIM}now{RESET}{color}{val_fmt.format(cur)}{RESET}")
+            return f"  {label:<14}: {spark}  {stats}"
+
+        # For counts & KV%, the natural floor is 0 — keep it pinned so the
+        # sparkline communicates absolute level. For rates & latencies, let
+        # the scale auto-fit so trend motion is visible (the min/max/now
+        # readout next to the bar already conveys absolute magnitude).
+        lines.append(trend_row("Running",      inst.hist_running,    "{:>4.0f}",
+                               fixed_min=0.0))
+        lines.append(trend_row("KV cache %",   inst.hist_kv,         "{:>5.1f}%",
+                               fixed_min=0.0, fixed_max=100.0, color_fn=_kv_color))
+        lines.append(trend_row("in tok/s",     inst.hist_prompt_rps, "{:>6.0f}",
+                               fixed_min=None))
+        lines.append(trend_row("out tok/s",    inst.hist_gen_rps,    "{:>6.0f}",
+                               fixed_min=None))
+        lines.append(trend_row("TTFT P95 ms",  inst.hist_ttft_p95,   "{:>6.0f}",
+                               fixed_min=None))
+        lines.append(trend_row("TPOT P95 ms",  inst.hist_tpot_p95,   "{:>6.1f}",
+                               fixed_min=None))
+        lines.append("")
 
     # ── Cumulative ──
     if s is not None:
@@ -656,6 +769,76 @@ def render_table(instances: List[Instance], interval: float) -> None:
     sys.stdout.flush()
 
 
+# ──────────────────────── auto-discovery (--auto) ────────────────────────
+DEFAULT_DISCOVER_RANGE = (8000, 8015)   # inclusive on both ends
+
+
+def parse_port_range(spec: str) -> Tuple[int, int]:
+    """Parse '8000-8015' or '8000:8015' or '8000,8015' into (lo, hi)."""
+    for sep in ("-", ":", ","):
+        if sep in spec:
+            a, b = spec.split(sep, 1)
+            return int(a.strip()), int(b.strip())
+    # Single port: treat as a one-port range
+    p = int(spec.strip())
+    return p, p
+
+
+def _probe_tcp(host: str, port: int, timeout: float) -> bool:
+    """Quick TCP connect check — true if the port is open."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (OSError, socket.timeout):
+        return False
+
+
+def _probe_vllm_metrics(host: str, port: int, timeout: float) -> bool:
+    """True if http://host:port/metrics returns text that looks like vLLM."""
+    url = f"http://{host}:{port}/metrics"
+    try:
+        body = fetch_metrics(url, timeout=timeout)
+    except Exception:
+        return False
+    # Heuristic: vLLM exports metric names with the `vllm:` prefix.
+    return "vllm:" in body
+
+
+def discover_vllm_endpoints(host: str = "localhost",
+                            port_range: Tuple[int, int] = DEFAULT_DISCOVER_RANGE,
+                            connect_timeout: float = 0.3,
+                            fetch_timeout: float = 1.5) -> List[str]:
+    """Find all vLLM-shaped `/metrics` endpoints on `host` within the port range.
+
+    Two parallel passes:
+      1. TCP-connect probe to filter to actually-open ports (cheap)
+      2. HTTP probe of `/metrics` on those ports, checking for the `vllm:`
+         metric-name prefix (more expensive, but only runs on open ports)
+    """
+    lo, hi = port_range
+    ports = list(range(lo, hi + 1))
+    if not ports:
+        return []
+
+    # Pass 1: which ports accept TCP connections?
+    with ThreadPoolExecutor(max_workers=min(32, len(ports))) as ex:
+        open_ports = [p for p, ok in zip(
+            ports,
+            ex.map(lambda p: _probe_tcp(host, p, connect_timeout), ports)
+        ) if ok]
+
+    if not open_ports:
+        return []
+
+    # Pass 2: which open ports speak vLLM's /metrics dialect?
+    with ThreadPoolExecutor(max_workers=min(32, len(open_ports))) as ex:
+        is_vllm = list(ex.map(
+            lambda p: _probe_vllm_metrics(host, p, fetch_timeout), open_ports
+        ))
+
+    return [f"http://{host}:{p}" for p, ok in zip(open_ports, is_vllm) if ok]
+
+
 # ──────────────────────────────── main ───────────────────────────────────
 def _expand_urls(raw: List[str]) -> List[str]:
     """Allow comma-separated values inside any --url arg."""
@@ -675,8 +858,17 @@ def main() -> None:
     )
     ap.add_argument("-V", "--version", action="version",
                     version=f"vllm-htop {__version__}")
-    ap.add_argument("--url", nargs="+", default=["http://localhost:8000"],
-                    help="One or more vLLM server base URLs (space- or comma-separated).")
+    ap.add_argument("--url", nargs="+", default=None,
+                    help="One or more vLLM server base URLs (space- or comma-separated). "
+                         "Default: http://localhost:8000 (unless --auto is set).")
+    ap.add_argument("--auto", action="store_true",
+                    help="auto-discover vLLM endpoints on localhost by scanning a port range "
+                         "(see --port-range). Mutually exclusive with --url.")
+    ap.add_argument("--port-range", default=f"{DEFAULT_DISCOVER_RANGE[0]}-{DEFAULT_DISCOVER_RANGE[1]}",
+                    help=f"port range for --auto, e.g. '8000-8015' "
+                         f"(default: {DEFAULT_DISCOVER_RANGE[0]}-{DEFAULT_DISCOVER_RANGE[1]})")
+    ap.add_argument("--host", default="localhost",
+                    help="hostname for --auto discovery (default: localhost)")
     ap.add_argument("--interval", type=float, default=2.0,
                     help="polling interval in seconds (default: 2.0)")
     ap.add_argument("--timeout",  type=float, default=4.0,
@@ -689,9 +881,45 @@ def main() -> None:
                     help="force per-replica detail view (only sensible for a single URL)")
     args = ap.parse_args()
 
-    urls = _expand_urls(args.url)
-    if not urls:
-        sys.exit("no URLs provided")
+    if args.auto and args.url:
+        sys.exit("--auto and --url are mutually exclusive")
+
+    if args.url:
+        # Explicit URLs — skip discovery entirely
+        urls = _expand_urls(args.url)
+        if not urls:
+            sys.exit("no URLs provided")
+    else:
+        # No explicit --url: auto-discover by default. When the user passes
+        # --auto explicitly, we're chatty and fail loudly; when discovery is
+        # implicit, we stay quiet on the single-instance happy path and fall
+        # back gracefully if nothing turns up.
+        try:
+            lo, hi = parse_port_range(args.port_range)
+        except ValueError as e:
+            sys.exit(f"invalid --port-range {args.port_range!r}: {e}")
+
+        if args.auto:
+            print(f"vllm-htop: scanning {args.host}:{lo}-{hi} for vLLM endpoints...",
+                  file=sys.stderr, flush=True)
+
+        urls = discover_vllm_endpoints(host=args.host, port_range=(lo, hi))
+
+        if urls:
+            # Narrate when there's something interesting to say. A single
+            # found endpoint on the default range is the boring case — stay quiet.
+            if args.auto or len(urls) > 1:
+                print(f"vllm-htop: discovered {len(urls)} endpoint(s): "
+                      + ", ".join(urls), file=sys.stderr, flush=True)
+        else:
+            if args.auto:
+                sys.exit(f"no vLLM endpoints found on {args.host}:{lo}-{hi}. "
+                         f"Try a wider --port-range or pass --url explicitly.")
+            # Implicit discovery turned up nothing — fall back to the host's
+            # default port. The subsequent fetch error (if any) will tell the
+            # user what went wrong, more informatively than a generic "no
+            # endpoints found".
+            urls = [f"http://{args.host}:8000"]
 
     instances = [
         Instance(name=str(i), url=u.rstrip("/") + "/metrics")

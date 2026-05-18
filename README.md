@@ -91,11 +91,36 @@ vllm-htop --url http://localhost:{8000,8001,8002,8003}
 
 Automatically switches to compact per-replica rows + aggregate + imbalance check.
 
+### Auto-discovery — one machine, many DP replicas
+
+If you don't pass `--url`, `vllm-htop` scans `localhost:8000-8015` for vLLM-shaped `/metrics` endpoints and attaches to whatever it finds. So when you have multiple `vllm serve` processes on the same host (one per port), monitoring all of them is just:
+
+```bash
+vllm-htop
+```
+
+It narrates the discovery only when interesting (≥2 endpoints found, or `--auto` was explicit); the single-instance case stays quiet.
+
+```bash
+# Force discovery (fails loudly if nothing's found — useful in scripts)
+vllm-htop --auto
+
+# Wider range, different host
+vllm-htop --auto --host 10.0.0.7 --port-range 9000-9031
+```
+
+Discovery does a parallel TCP probe over the range, then HTTP-probes only the open ports for the `vllm:` metric-name prefix, so it's fast (typically <100ms on a localhost scan) even on wide ranges. Non-vLLM services on the same ports are filtered out, not confused for replicas.
+
+If discovery turns up nothing and you didn't pass `--auto`, the tool falls back to `http://<host>:8000` and surfaces the real fetch error there — more useful than a generic "no endpoints found".
+
 ### Flags
 
 | Flag | Default | What it does |
 |---|---|---|
-| `--url URL [URL ...]` | `http://localhost:8000` | One or more vLLM base URLs (space- or comma-separated) |
+| `--url URL [URL ...]` | _(auto-discovery)_ | Explicit vLLM base URLs. Overrides auto-discovery |
+| `--auto` | _(implicit default)_ | Force discovery, fail loudly if nothing found. Without `--url`, discovery already runs implicitly |
+| `--host HOST` | `localhost` | Hostname for discovery and the fallback URL |
+| `--port-range LO-HI` | `8000-8015` | Port range for discovery (e.g. `8000-8015`, `8000:8015`) |
 | `--interval N` | `2.0` | Refresh interval in seconds |
 | `--timeout N` | `4.0` | Per-endpoint fetch timeout |
 | `--once` | off | Print one snapshot and exit (good for cron / CI smoke tests) |
