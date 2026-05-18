@@ -47,7 +47,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 
 # ───────────────────────────── ANSI styling ──────────────────────────────
