@@ -37,6 +37,8 @@ No third-party dependencies. Python 3.8+.
 """
 
 import argparse
+import atexit
+import json
 import re
 import socket
 import subprocess
@@ -48,7 +50,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "0.2.2"
+__version__ = "0.3.0"
 
 
 # ───────────────────────────── ANSI styling ──────────────────────────────
@@ -58,11 +60,49 @@ CYAN, GREEN, YELLOW, RED, GRAY = (
 )
 CLEAR = "\033[2J\033[H"
 
+# Alternate-screen-buffer control — the same trick htop/vim/less use to claim
+# the whole terminal while running and restore it on exit. Activated only for
+# the interactive monitoring loop; piping, --once, and JSON modes skip it.
+ALT_SCREEN_ENTER = "\033[?1049h\033[?25l"   # enter alt screen + hide cursor
+ALT_SCREEN_LEAVE = "\033[?25h\033[?1049l"   # show cursor + leave alt screen
+_alt_screen_active = False
+
+
+def enter_alt_screen() -> None:
+    """Switch the terminal into its alternate-screen buffer (htop-style)."""
+    global _alt_screen_active
+    if _alt_screen_active:
+        return
+    sys.stdout.write(ALT_SCREEN_ENTER)
+    sys.stdout.flush()
+    _alt_screen_active = True
+    # Belt-and-braces: even if we exit via an unhandled exception or a signal
+    # we don't catch, atexit still runs and the user gets their terminal back.
+    atexit.register(leave_alt_screen)
+
+
+def leave_alt_screen() -> None:
+    """Restore the terminal to the normal screen buffer."""
+    global _alt_screen_active
+    if not _alt_screen_active:
+        return
+    sys.stdout.write(ALT_SCREEN_LEAVE)
+    sys.stdout.flush()
+    _alt_screen_active = False
+
 # ───────────────────────── trend / sparkline config ──────────────────────
 HISTORY_LEN = 60          # rolling samples kept per metric (≈2 min @ 2s interval)
 SPARK_WIDTH = 30          # characters per sparkline
 # 8 levels of vertical block. Space (idx 0) is reserved for "no data" padding.
 SPARK_BLOCKS = " ▁▂▃▄▅▆▇█"
+
+# How long we keep raw histogram snapshots around, in seconds. Bounds memory
+# for the long-window percentile (e.g. P95-over-the-last-1-minute). At the
+# default 2s polling interval this is 300 snapshots per replica.
+HISTORY_RETENTION_SECS = 600.0    # 10 minutes
+# Default long window length surfaced as "P95@1m" — picked to be much more
+# stable than the noisy 2s delta but still feel "live."
+LONG_WINDOW_SECS = 60.0
 
 
 # ─────────────────────── which metrics we surface ────────────────────────
@@ -144,14 +184,27 @@ def parse_snapshot(raw: str, engine_filter: Optional[str] = None) -> Snapshot:
     def keep(labels: Dict[str, str]) -> bool:
         return engine_filter is None or labels.get("engine") == engine_filter
 
+    # Surface a few standard Prometheus process_* metrics (auto-exported by
+    # the python prometheus_client) in addition to vLLM's own. We need
+    # `process_start_time_seconds` to compute vLLM's true uptime, which the
+    # Cost section uses for lifetime compute cost.
+    PROCESS_METRICS = ("process_start_time_seconds",)
+
+    def keep_for(name_: str, labels: Dict[str, str]) -> bool:
+        # process_* metrics are process-wide (no engine label) — every engine
+        # filter should still see them.
+        if name_ in PROCESS_METRICS:
+            return True
+        return keep(labels)
+
     for name, kind in types.items():
-        if not name.startswith("vllm"):
+        if not (name.startswith("vllm") or name in PROCESS_METRICS):
             continue
         if kind == "counter":
             total = 0.0
             for sample_name in (name, name + "_total"):
                 for labels, v in samples.get(sample_name, []):
-                    if keep(labels):
+                    if keep_for(name, labels):
                         total += v
             snap.counters[name] = total
         elif kind == "gauge":
@@ -187,6 +240,38 @@ def detect_engines(raw: str) -> List[str]:
             if eng is not None:
                 engines.add(eng)
     return sorted(engines, key=lambda e: int(e) if e.isdigit() else e)
+
+
+def detect_model_name(raw: str) -> Optional[str]:
+    """Extract the served model name from /metrics labels, if any.
+
+    vLLM exposes the model identifier as a label on most metrics. The label
+    key varies slightly across versions — we try the common spellings in
+    order of preference.
+    """
+    _types, samples = parse_prom_text(raw)
+    for key in ("model_name", "served_model_name", "model"):
+        for sample_list in samples.values():
+            for labels, _ in sample_list:
+                v = labels.get(key)
+                if v:
+                    return v
+    return None
+
+
+def short_model_name(full: str, max_len: int = 24) -> str:
+    """Squeeze a HuggingFace-style model id into a name friendly for table rows.
+
+    Strategy: take the part after the last `/` (drops the org prefix), and
+    if it's still longer than `max_len` characters truncate with `…`.
+
+    Examples:
+        meta-llama/Meta-Llama-3-8B-Instruct  →  Meta-Llama-3-8B-Instruct
+        BAAI/bge-large-zh-v1.5                →  bge-large-zh-v1.5
+        nvidia/Llama-3_1-Nemotron-253B-NF4    →  Llama-3_1-Nemotron-253B…
+    """
+    short = full.rsplit("/", 1)[-1]
+    return short if len(short) <= max_len else short[: max_len - 1] + "…"
 
 
 # ───────────────────────────── analytics ─────────────────────────────────
@@ -418,6 +503,27 @@ class CostConfig:
         return self.compute_per_hour * (secs / 3600.0)
 
 
+def vllm_uptime_seconds(instances: List["Instance"]) -> Optional[float]:
+    """Estimate vLLM's true uptime from `process_start_time_seconds` exported
+    by python's prometheus_client. Returns None if no replica exposes it.
+
+    For multi-URL deployments we take the *earliest* start time across
+    replicas — i.e. the time the first replica came up. That's a slightly
+    conservative estimate for lifetime compute cost (which is itself a
+    rough ±30% number).
+    """
+    starts: List[float] = []
+    for inst in instances:
+        if inst.snapshot is None:
+            continue
+        n = find_metric(inst.snapshot.gauges, "process_start_time_seconds")
+        if n:
+            starts.append(inst.snapshot.gauges[n])
+    if not starts:
+        return None
+    return max(0.0, time.time() - min(starts))
+
+
 def fmt_money(v: Optional[float], symbol: str = "$") -> str:
     """Format a monetary value with thousands separators and adaptive precision."""
     if v is None:
@@ -438,6 +544,9 @@ class Instance:
     # When set, this Instance is one engine of a multi-engine /metrics endpoint
     # (vLLM internal DP). Fetches go to `url`, parsing filters by this label.
     engine: Optional[str] = None
+    # Served model name, extracted from /metrics labels on first probe.
+    # Used to make `name` human-readable (e.g. "Llama-3.1-8B-Instruct.e0").
+    model: Optional[str] = None
     snapshot: Optional[Snapshot] = None
     prev: Optional[Snapshot] = None
     error: Optional[str] = None
@@ -460,6 +569,10 @@ class Instance:
     # replica, so "session cost" can subtract them from current totals.
     baseline_prompt_tokens: Optional[float] = None
     baseline_gen_tokens:    Optional[float] = None
+    # Rolling buffer of recent snapshots — used to compute percentiles over
+    # longer windows than the single poll-to-poll delta. Trimmed by timestamp
+    # in `_apply_raw` (default retention: HISTORY_RETENTION_SECS = 10 min).
+    snapshot_history: List[Snapshot] = field(default_factory=list)
 
 
 def fetch_metrics(url: str, timeout: float = 5.0) -> str:
@@ -546,6 +659,11 @@ def _apply_raw(inst: Instance, raw: str) -> None:
         inst.error = None
         _update_session(inst)
         _update_history(inst)
+        # Rolling snapshot buffer for long-window percentile.
+        inst.snapshot_history.append(inst.snapshot)
+        cutoff = inst.snapshot.timestamp - HISTORY_RETENTION_SECS
+        while inst.snapshot_history and inst.snapshot_history[0].timestamp < cutoff:
+            inst.snapshot_history.pop(0)
     except Exception as e:
         inst.error = f"{type(e).__name__}: {e}"
 
@@ -584,12 +702,19 @@ def fetch_all(instances: List[Instance], timeout: float = 5.0) -> None:
 
 def expand_instances_by_engine(instances: List[Instance],
                                timeout: float = 5.0) -> List[Instance]:
-    """Probe each URL once; for endpoints that expose multiple `engine` labels,
-    expand the single Instance into one Instance per engine.
+    """Probe each URL once; pick a human-readable display name (model when we
+    can, URL index otherwise); expand multi-engine endpoints into one Instance
+    per engine.
 
     Called once at startup. The returned list is what the monitor loop polls.
-    If a URL is unreachable on this initial probe we keep the original Instance
-    — it'll just render as DOWN until the network recovers.
+    Names chosen here:
+      * Pure external DP (single engine per URL), distinct models → model names
+      * Multi-engine URL → `<base>.eN` where `<base>` is the model or URL index
+      * Model collisions across URLs → fall back to the URL index, since a
+        duplicated name would be ambiguous in the table
+
+    If a URL is unreachable on this initial probe we keep the original
+    Instance — it'll render as DOWN until the network recovers.
     """
     def probe(inst: Instance) -> Tuple[Instance, Optional[str]]:
         try:
@@ -600,29 +725,88 @@ def expand_instances_by_engine(instances: List[Instance],
     with ThreadPoolExecutor(max_workers=min(32, len(instances))) as ex:
         probed = list(ex.map(probe, instances))
 
+    # First pass — record (model, engines) per URL.
+    info: Dict[str, Tuple[Optional[str], List[str]]] = {}
+    for inst, raw in probed:
+        if raw is None:
+            info[inst.url] = (None, [])
+        else:
+            info[inst.url] = (detect_model_name(raw), detect_engines(raw))
+
+    # Are the model names unique across URLs? If two URLs serve the same model,
+    # we can't use the model name as a row identifier — fall back to URL index.
+    models = [m for m, _ in info.values() if m]
+    models_unique = len(models) == len(set(models)) and len(models) == len(info)
+
     multi_url = len(instances) > 1
     expanded: List[Instance] = []
     for inst, raw in probed:
         if raw is None:
-            # Probe failed — keep the Instance as-is; the next fetch attempt
-            # will surface the real fetch error.
             expanded.append(inst)
             continue
-        engines = detect_engines(raw)
-        if len(engines) <= 1:
-            expanded.append(inst)
+        model, engines = info[inst.url]
+
+        # Decide the row label base.
+        #   * If model names are unique → use the model (most informative)
+        #   * Else if there are several URLs → keep the URL index (disambiguates)
+        #   * Single URL with no engine label → display empty / engine-only
+        if models_unique and model:
+            base = short_model_name(model)
+        elif multi_url:
+            base = inst.name  # URL index, e.g. "0", "1"
         else:
-            # Multi-engine — fan out into per-engine sub-instances. Naming:
-            #   * external-only:   "0", "1", ...           (unchanged)
-            #   * internal-only:   "e0", "e1", ...
-            #   * mixed (N×M):     "0.e0", "0.e1", "1.e0", ...
+            base = ""
+
+        if len(engines) <= 1:
+            # No internal DP — one row for the whole URL.
+            display_name = base or inst.name
+            expanded.append(Instance(name=display_name, url=inst.url, model=model))
+        else:
+            # Internal DP — one row per engine. Build `base.eN` or just `eN`.
             for eng in engines:
-                sub_name = (f"{inst.name}.e{eng}" if multi_url else f"e{eng}")
-                expanded.append(Instance(name=sub_name, url=inst.url, engine=eng))
+                sub_name = f"{base}.e{eng}" if base else f"e{eng}"
+                expanded.append(Instance(name=sub_name, url=inst.url,
+                                         engine=eng, model=model))
     # Note: we deliberately don't seed any snapshots here — the monitor loop's
     # first fetch_all() does that. Seeding would set prev to a snapshot taken
     # microseconds earlier, giving meaningless rates on the first render.
     return expanded
+
+
+def long_window_percentile(inst: Instance, fragment: str,
+                           target_secs: float, q: float) -> Optional[float]:
+    """Percentile over the last `target_secs` of accumulated samples.
+
+    Looks back through `inst.snapshot_history` to find the oldest snapshot at
+    or before `now - target_secs` and computes the bucket delta from there to
+    the current snapshot. If we don't yet have that much history, falls back
+    to the oldest snapshot we do have (so the value is non-None as soon as
+    we've taken at least two polls).
+    """
+    s = inst.snapshot
+    if s is None or not inst.snapshot_history:
+        return None
+    target_ts = s.timestamp - target_secs
+    # Walk back to the latest snapshot at or before target_ts.
+    base: Optional[Snapshot] = None
+    for h in inst.snapshot_history:
+        if h is s:
+            break
+        if h.timestamp <= target_ts:
+            base = h
+    if base is None:
+        # Not enough history — fall back to the oldest snapshot we have.
+        base = inst.snapshot_history[0]
+    if base is s:
+        return None
+    name = find_metric(s.histograms, fragment)
+    if not name:
+        return None
+    base_h = base.histograms.get(name)
+    if not base_h:
+        return None
+    wb, wc = window_buckets(s.histograms[name], base_h)
+    return histogram_percentile(wb, wc, q)
 
 
 def summarize(inst: Instance) -> Optional[Dict[str, Any]]:
@@ -652,8 +836,30 @@ def summarize(inst: Instance) -> Optional[Dict[str, Any]]:
         wb, wc = window_buckets(s.histograms[n], prev_h)
         return histogram_percentile(wb, wc, q)
 
+    def long_pct(frag: str, q: float) -> Optional[float]:
+        return long_window_percentile(inst, frag, LONG_WINDOW_SECS, q)
+
     kv = gauge(GAUGE_FRAGMENTS["kv_cache"])
     kv_pct: Optional[float] = (kv * 100) if (kv is not None and kv <= 1.0) else kv
+
+    # Prefix cache hit rate — windowed and lifetime.
+    # vLLM exposes per-version: `vllm:prefix_cache_queries_total` and
+    # `vllm:prefix_cache_hits_total`. Both names contain "prefix_cache".
+    def cache_lifetime_hit_pct() -> Optional[float]:
+        qn = find_metric(s.counters, "prefix_cache_queries")
+        hn = find_metric(s.counters, "prefix_cache_hits")
+        if not qn or not hn:
+            return None
+        q = s.counters.get(qn, 0.0)
+        h = s.counters.get(hn, 0.0)
+        return (h / q * 100) if q > 0 else None
+
+    def cache_window_hit_pct() -> Optional[float]:
+        q_rps = rate("prefix_cache_queries")
+        h_rps = rate("prefix_cache_hits")
+        if q_rps is None or h_rps is None or q_rps <= 0:
+            return None
+        return h_rps / q_rps * 100
 
     return {
         "running":    gauge(GAUGE_FRAGMENTS["running"]),
@@ -673,6 +879,14 @@ def summarize(inst: Instance) -> Optional[Dict[str, Any]]:
         "e2e_p95":    win_pct("e2e_request_latency",   0.95),
         "e2e_p99":    win_pct("e2e_request_latency",   0.99),
         "queue_p95":  win_pct("request_queue_time",    0.95),
+        # Long-window P95 (rolling ~1min) — more stable than the noisy
+        # poll-to-poll number, useful as a "current SLO state" reference.
+        "ttft_p95_long":  long_pct("time_to_first_token",   0.95),
+        "tpot_p95_long":  long_pct("time_per_output_token", 0.95),
+        "e2e_p95_long":   long_pct("e2e_request_latency",   0.95),
+        "queue_p95_long": long_pct("request_queue_time",    0.95),
+        "cache_hit_pct":      cache_window_hit_pct(),
+        "cache_hit_pct_life": cache_lifetime_hit_pct(),
         "_snap": s, "_prev": p, "_dt": dt,
     }
 
@@ -749,6 +963,12 @@ def _kv_color(p: Optional[float]) -> str:
     return RED if p > 85 else YELLOW if p > 65 else ""
 
 
+def _cache_color(p: Optional[float]) -> str:
+    """Higher is better for prefix-cache hit rate."""
+    if p is None: return ""
+    return GREEN if p >= 60 else YELLOW if p >= 30 else RED
+
+
 def _wait_color(w: Optional[float]) -> str:
     if not w: return ""
     return RED if w > 5 else YELLOW
@@ -782,8 +1002,11 @@ def render_detail(inst: Instance, cost: Optional[CostConfig] = None) -> None:
         lines.append(f"  {DIM}(collecting first sample…){RESET}")
     lines.append("")
 
+    # Latency table: short window (P50/P95/P99 from the latest poll-to-poll
+    # delta) plus a longer-window P95 column for SLO-style stability.
+    long_label = f"P95@{int(LONG_WINDOW_SECS)}s" if LONG_WINDOW_SECS < 60 else f"P95@{int(LONG_WINDOW_SECS/60)}m"
     lines.append(f"{BOLD}▸ Latency{RESET}  {DIM}(windowed percentiles){RESET}")
-    lines.append(f"  {DIM}{'metric':<12}{'P50':>10}{'P95':>10}{'P99':>10}{RESET}")
+    lines.append(f"  {DIM}{'metric':<12}{'P50':>10}{'P95':>10}{'P99':>10}{long_label:>10}{RESET}")
     for label, fragment, scale in HIST_METRICS:
         if not s or not find_metric(s.histograms, fragment):
             continue
@@ -795,11 +1018,13 @@ def render_detail(inst: Instance, cost: Optional[CostConfig] = None) -> None:
             "e2e"  if "e2e"          in fragment else
             "queue"
         )
-        p50 = smry and smry.get(f"{key}_p50")
-        p95 = smry and smry.get(f"{key}_p95")
-        p99 = smry and smry.get(f"{key}_p99")
+        p50      = smry and smry.get(f"{key}_p50")
+        p95      = smry and smry.get(f"{key}_p95")
+        p99      = smry and smry.get(f"{key}_p99")
+        p95_long = smry and smry.get(f"{key}_p95_long")
         lines.append(f"  {label:<12}"
-                     f"{fmt(scaled(p50)):>10}{fmt(scaled(p95)):>10}{fmt(scaled(p99)):>10}")
+                     f"{fmt(scaled(p50)):>10}{fmt(scaled(p95)):>10}{fmt(scaled(p99)):>10}"
+                     f"{fmt(scaled(p95_long)):>10}")
     lines.append("")
 
     lines.append(f"{BOLD}▸ Saturation{RESET}  {DIM}(current){RESET}")
@@ -814,6 +1039,17 @@ def render_detail(inst: Instance, cost: Optional[CostConfig] = None) -> None:
             lines.append(f"  KV cache usage    :  {kc}{BOLD}{smry['kv_pct']:>5.1f}%{RESET}  {bar(smry['kv_pct'])}")
         else:
             lines.append(f"  KV cache usage    :     —")
+        # Prefix cache hit rate (only if vLLM exposes the counter at all)
+        if smry["cache_hit_pct_life"] is not None or smry["cache_hit_pct"] is not None:
+            win = smry["cache_hit_pct"]
+            life = smry["cache_hit_pct_life"]
+            cc_w = _cache_color(win)
+            cc_l = _cache_color(life)
+            lines.append(
+                f"  Prefix cache hit  :  "
+                f"{cc_w}{BOLD}{fmt(win, '{:>5.1f}', '   —')}%{RESET} {DIM}window{RESET}"
+                f"   {cc_l}{BOLD}{fmt(life, '{:>5.1f}', '   —')}%{RESET} {DIM}life{RESET}"
+            )
     lines.append("")
 
     # ── Trend (sparklines over recent samples) ──
@@ -923,6 +1159,11 @@ def render_detail(inst: Instance, cost: Optional[CostConfig] = None) -> None:
                          f"{cost.currency}{cost.gpu_cost_hour:g}/h{src}){RESET}")
             lines.append(f"    Burn rate        : {BOLD}{fmt_money(cost.compute_per_hour, cost.currency):>12}/hour{RESET}  "
                          f"{DIM}(paid whether busy or idle){RESET}")
+            # Lifetime — uses vLLM's reported process start time when available
+            vllm_up = vllm_uptime_seconds([inst])
+            if vllm_up is not None and vllm_up > 0:
+                lines.append(f"    Lifetime         : {BOLD}{fmt_money(cost.for_seconds(vllm_up), cost.currency):>12}{RESET}  "
+                             f"{DIM}(over {fmt_duration(vllm_up)} of vLLM uptime){RESET}")
             lines.append(f"    This session     : {BOLD}{fmt_money(cost.for_seconds(uptime), cost.currency):>12}{RESET}  "
                          f"{DIM}(over {fmt_duration(uptime)}){RESET}")
 
@@ -946,6 +1187,134 @@ def render_detail(inst: Instance, cost: Optional[CostConfig] = None) -> None:
     sys.stdout.flush()
 
 
+def _median(values: List[float]) -> float:
+    """Plain median (no statistics-module dep). Caller must pass a non-empty list."""
+    s = sorted(values)
+    n = len(s)
+    return s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2])
+
+
+def _imbalance_check_for_group(
+    group: List[Tuple[Instance, Dict[str, Any]]],
+) -> Tuple[List[Tuple[str, str, bool]], int]:
+    """Run the 4 imbalance checks over a group of replicas (already filtered
+    to one model, all with valid summaries).
+
+    Returns (results, n_checks) where each result is (label, detail, is_bad).
+    Median-based outlier detection: ratio = max / median. Robust to idle
+    replicas (which would otherwise drag min to 0 and inflate max/min).
+    """
+    results: List[Tuple[str, str, bool]] = []
+
+    # Running req — flag a single dominant replica
+    runs = [(i, s["running"]) for i, s in group if s["running"] is not None]
+    if len(runs) >= 2:
+        rs = [r[1] for r in runs]
+        r_min, r_max = min(rs), max(rs)
+        r_med = _median(rs)
+        outlier = max(runs, key=lambda x: x[1])[0]
+        bad = (r_max - r_min) > 3 and r_max > 1.5 * max(1.0, r_med)
+        if bad:
+            detail = (f"{BOLD}{outlier.name}{RESET}: {r_max:.0f} running "
+                      f"(median {r_med:.0f}, others as low as {r_min:.0f})")
+        else:
+            detail = f"range {r_min:.0f}–{r_max:.0f}, median {r_med:.0f}"
+        results.append(("Running req", detail, bad))
+
+    # KV cache — Δ in percentage points, threshold 15pp
+    kvs = [(i, s["kv_pct"]) for i, s in group if s["kv_pct"] is not None]
+    if len(kvs) >= 2:
+        ks = [k[1] for k in kvs]
+        k_min, k_max = min(ks), max(ks)
+        outlier = max(kvs, key=lambda x: x[1])[0]
+        bad = (k_max - k_min) > 15
+        if bad:
+            detail = (f"{BOLD}{outlier.name}{RESET}: {k_max:.1f}% "
+                      f"(others as low as {k_min:.1f}%, Δ={k_max - k_min:.1f}pp)")
+        else:
+            detail = f"range {k_min:.1f}%–{k_max:.1f}%"
+        results.append(("KV cache", detail, bad))
+
+    # TTFT P95 — outlier vs median, threshold 2×
+    ttfts = [(i, s["ttft_p95"] * 1000) for i, s in group if s["ttft_p95"] is not None]
+    if len(ttfts) >= 2:
+        ts = [t[1] for t in ttfts]
+        t_med = _median(ts)
+        t_max = max(ts)
+        outlier = max(ttfts, key=lambda x: x[1])[0]
+        ratio = t_max / max(0.001, t_med)
+        bad = ratio > 1.5
+        if bad:
+            detail = (f"{BOLD}{outlier.name}{RESET}: {t_max:.0f}ms is "
+                      f"{ratio:.1f}× median ({t_med:.0f}ms)")
+        else:
+            detail = f"median {t_med:.0f}ms, max {t_max:.0f}ms ({ratio:.1f}×)"
+        results.append(("slow-replica (TTFT)", detail, bad))
+
+    # TPOT P95 — outlier vs median, threshold 2×
+    tpots = [(i, s["tpot_p95"] * 1000) for i, s in group if s["tpot_p95"] is not None]
+    if len(tpots) >= 2:
+        ts = [t[1] for t in tpots]
+        t_med = _median(ts)
+        t_max = max(ts)
+        outlier = max(tpots, key=lambda x: x[1])[0]
+        ratio = t_max / max(0.001, t_med)
+        bad = ratio > 1.5
+        if bad:
+            detail = (f"{BOLD}{outlier.name}{RESET}: {t_max:.1f}ms is "
+                      f"{ratio:.1f}× median ({t_med:.1f}ms)")
+        else:
+            detail = f"median {t_med:.1f}ms, max {t_max:.1f}ms ({ratio:.1f}×)"
+        results.append(("slow-decode (TPOT)", detail, bad))
+
+    return results, len(results)
+
+
+def _render_imbalance_sections(
+    summaries: List[Tuple[Instance, Optional[Dict[str, Any]]]],
+) -> List[List[str]]:
+    """Yield one block of lines per model-group that has ≥2 ok replicas.
+
+    Healthy groups collapse to a single line; groups with at least one
+    failed check expand to detail. Groups are labeled by short model name
+    when multiple models are present in the deployment.
+    """
+    # Group by model (None / missing → "_unlabeled" bucket).
+    by_model: Dict[Optional[str], List[Tuple[Instance, Dict[str, Any]]]] = {}
+    for inst, s in summaries:
+        if s is None:
+            continue
+        by_model.setdefault(inst.model, []).append((inst, s))
+
+    multi_model = len([k for k in by_model if k is not None]) > 1
+    blocks: List[List[str]] = []
+    for model, group in by_model.items():
+        if len(group) < 2:
+            continue
+        results, n_checks = _imbalance_check_for_group(group)
+        if not results:
+            continue
+
+        n_bad = sum(1 for _, _, is_bad in results if is_bad)
+        # Header — show model label only when multiple models share the deployment.
+        suffix = f"  {DIM}(× {len(group)} replicas){RESET}"
+        if multi_model and model:
+            head = f"{BOLD}▸ Imbalance check  {short_model_name(model)}{RESET}{suffix}"
+        else:
+            head = f"{BOLD}▸ Imbalance check{RESET}{suffix}"
+
+        if n_bad == 0:
+            # Healthy → collapse into one line, no detail
+            blocks.append([f"{head}  {GREEN}✓ all {n_checks} checks pass{RESET}"])
+        else:
+            block = [f"{head}  {YELLOW}⚠ {n_bad}/{n_checks} failed{RESET}"]
+            for label, detail, bad in results:
+                icon = f"{RED}⚠{RESET}" if bad else f"{GREEN}✓{RESET}"
+                block.append(f"  {icon} {label:<20} {detail}")
+            blocks.append(block)
+    return blocks
+
+
 def render_table(instances: List[Instance], interval: float,
                  cost: Optional[CostConfig] = None) -> None:
     """Per-DP comparison table + aggregate row + imbalance check."""
@@ -966,15 +1335,28 @@ def render_table(instances: List[Instance], interval: float,
     lines.append(f"{BOLD}{CYAN}vLLM DP Monitor{RESET}  {DIM}│{RESET}  "
                  f"{health}  {DIM}│{RESET}  {ts}  {DIM}(interval={interval}s){RESET}")
     lines.append(rule)
-    lines.append(f"{DIM} {'DP':<{name_w}}  Status   Run  Wait  Swap   KV%      in tok/s  out tok/s   TTFT-P95  TPOT-P95{RESET}")
+    # Only show the Cache% column when at least one replica exposes prefix-cache
+    # metrics — saves table width on older vLLM versions that don't have them.
+    show_cache = any(
+        smry and (smry.get("cache_hit_pct") is not None
+                  or smry.get("cache_hit_pct_life") is not None)
+        for _, smry in summaries
+    )
+    cache_hdr = f"  Cache%" if show_cache else ""
+    cache_pad = 8 if show_cache else 0
+    rule = GRAY + "─" * (86 + pad_extra + cache_pad) + RESET
+    lines[-1] = rule  # replace the rule we appended earlier
+    lines.append(f"{DIM} {'DP':<{name_w}}  Status   Run  Wait  Swap   KV%{cache_hdr}      in tok/s  out tok/s   TTFT-P95  TPOT-P95{RESET}")
     lines.append(rule)
 
     have_first_sample = False
     for inst, smry in summaries:
         if smry is None:
             err = (inst.error or "no data yet")[:34]
+            cache_dash = f"{GRAY}     —{RESET}" if show_cache else ""
             lines.append(f" {inst.name:<{name_w}} {RED}DOWN  {RESET} "
-                         f"{GRAY}  —     —     —      —          —          —          —         —{RESET}  "
+                         f"{GRAY}  —     —     —      —{RESET}{cache_dash}"
+                         f"{GRAY}          —          —          —         —{RESET}  "
                          f"{DIM}{err}{RESET}")
             continue
         if smry.get("_prev") is not None:
@@ -987,12 +1369,23 @@ def render_table(instances: List[Instance], interval: float,
         ttft_ms = (smry["ttft_p95"] * 1000) if smry["ttft_p95"] is not None else None
         tpot_ms = (smry["tpot_p95"] * 1000) if smry["tpot_p95"] is not None else None
 
+        # Cache% cell (only when column is shown). Prefer window value;
+        # fall back to lifetime if window hasn't accumulated samples yet.
+        cache_cell = ""
+        if show_cache:
+            cache_v = smry["cache_hit_pct"]
+            if cache_v is None:
+                cache_v = smry["cache_hit_pct_life"]
+            cc = _cache_color(cache_v)
+            cache_cell = f"  {cc}{fmt(cache_v, '{:.0f}'):>4}%{RESET}"
+
         lines.append(
             f" {inst.name:<{name_w}} {status} "
             f"{fmt(smry['running'], '{:.0f}'):>4}  "
             f"{wc}{fmt(smry['waiting'], '{:.0f}'):>4}{RESET}  "
             f"{sc}{fmt(smry['swapped'], '{:.0f}'):>4}{RESET}   "
-            f"{kc}{fmt(smry['kv_pct'], '{:.1f}'):>5}%{RESET}    "
+            f"{kc}{fmt(smry['kv_pct'], '{:.1f}'):>5}%{RESET}"
+            f"{cache_cell}    "
             f"{fmt(smry['prompt_rps'], '{:.0f}'):>8}   "
             f"{fmt(smry['gen_rps'],    '{:.0f}'):>8}    "
             f"{fmt(ttft_ms, '{:.0f}'):>6}ms   "
@@ -1018,51 +1411,46 @@ def render_table(instances: List[Instance], interval: float,
         ttft_ms_all = (ttft_all * 1000) if ttft_all else None
         tpot_ms_all = (tpot_all * 1000) if tpot_all else None
 
+        # Aggregate Cache%: weighted by queries rate (so big replicas dominate).
+        agg_cache_cell = ""
+        if show_cache:
+            tot_q = tot_h = 0.0
+            for inst, sm in summaries:
+                if sm is None or sm.get("_prev") is None:
+                    continue
+                dt = sm.get("_dt") or 0.0
+                if dt <= 0:
+                    continue
+                s, p = sm["_snap"], sm["_prev"]
+                qn = find_metric(s.counters, "prefix_cache_queries")
+                hn = find_metric(s.counters, "prefix_cache_hits")
+                if qn and qn in p.counters:
+                    tot_q += max(0.0, s.counters[qn] - p.counters[qn])
+                if hn and hn in p.counters:
+                    tot_h += max(0.0, s.counters[hn] - p.counters[hn])
+            agg = (tot_h / tot_q * 100) if tot_q > 0 else None
+            cc = _cache_color(agg)
+            agg_cache_cell = f"  {cc}{fmt(agg, '{:.0f}'):>4}%{RESET}"
+
         lines.append(
             f" {BOLD}ALL{RESET}{' ' * (name_w - 3)}        "
             f" {sum_run:>4.0f}  "
             f"{sum_wait:>4.0f}  "
             f"{sum_swap:>4.0f}    "
-            f"{DIM}max{RESET}{fmt(max_kv, '{:.1f}'):>4}%    "
+            f"{DIM}max{RESET}{fmt(max_kv, '{:.1f}'):>4}%"
+            f"{agg_cache_cell}    "
             f"{sum_pin:>8.0f}   "
             f"{sum_pout:>8.0f}    "
             f"{fmt(ttft_ms_all, '{:.0f}'):>6}ms   "
             f"{fmt(tpot_ms_all, '{:.1f}'):>6}ms"
         )
 
-        # Imbalance check
-        if len(ok_smries) >= 2:
+        # Imbalance check — grouped by model (so LLM and embedding aren't
+        # compared cross-workload) with median-based outlier detection so
+        # idle replicas don't blow up the ratio.
+        for group_lines in _render_imbalance_sections(summaries):
             lines.append("")
-            lines.append(f"{BOLD}▸ Imbalance check{RESET}  {DIM}(across {len(ok_smries)} replicas){RESET}")
-
-            runs = [s["running"] for s in ok_smries if s["running"] is not None]
-            if len(runs) >= 2:
-                r_min, r_max = min(runs), max(runs)
-                bad = (r_max - r_min) > 3 and r_max > 1.5 * max(1, r_min)
-                tag = f"  {YELLOW}⚠ load-balancer skew?{RESET}" if bad else ""
-                lines.append(f"  Running req     : {r_min:>5.0f}  →  {r_max:<5.0f} (Δ={r_max-r_min:.0f}){tag}")
-
-            if len(kvs) >= 2:
-                k_min, k_max = min(kvs), max(kvs)
-                bad = (k_max - k_min) > 15
-                tag = f"  {YELLOW}⚠ uneven KV pressure{RESET}" if bad else ""
-                lines.append(f"  KV cache        : {k_min:>5.1f}% → {k_max:<5.1f}% (Δ={k_max-k_min:.1f}pp){tag}")
-
-            ttfts = [s["ttft_p95"] for s in ok_smries if s["ttft_p95"] is not None]
-            if len(ttfts) >= 2:
-                t_min, t_max = min(ttfts) * 1000, max(ttfts) * 1000
-                ratio = t_max / max(0.001, t_min)
-                bad = ratio > 1.5
-                tag = f"  {YELLOW}⚠ slow replica{RESET}" if bad else ""
-                lines.append(f"  TTFT P95        : {t_min:>5.0f}ms → {t_max:<5.0f}ms ({ratio:.2f}×){tag}")
-
-            tpots = [s["tpot_p95"] for s in ok_smries if s["tpot_p95"] is not None]
-            if len(tpots) >= 2:
-                t_min, t_max = min(tpots) * 1000, max(tpots) * 1000
-                ratio = t_max / max(0.001, t_min)
-                bad = ratio > 1.5
-                tag = f"  {YELLOW}⚠ slow decode{RESET}" if bad else ""
-                lines.append(f"  TPOT P95        : {t_min:>5.1f}ms → {t_max:<5.1f}ms ({ratio:.2f}×){tag}")
+            lines.extend(group_lines)
 
     if not have_first_sample:
         lines.append("")
@@ -1164,6 +1552,10 @@ def render_table(instances: List[Instance], interval: float,
                              f"{cost.currency}{cost.gpu_cost_hour:g}/h{src}){RESET}")
                 lines.append(f"    Burn rate    : {BOLD}{fmt_money(cost.compute_per_hour, cost.currency):>12}/hour{RESET}  "
                              f"{DIM}(paid whether busy or idle){RESET}")
+                vllm_up = vllm_uptime_seconds(instances)
+                if vllm_up is not None and vllm_up > 0:
+                    lines.append(f"    Lifetime     : {BOLD}{fmt_money(cost.for_seconds(vllm_up), cost.currency):>12}{RESET}  "
+                                 f"{DIM}(over {fmt_duration(vllm_up)} of vLLM uptime){RESET}")
                 lines.append(f"    This session : {BOLD}{fmt_money(cost.for_seconds(uptime), cost.currency):>12}{RESET}  "
                              f"{DIM}(over {fmt_duration(uptime)}){RESET}")
 
@@ -1182,20 +1574,201 @@ def render_table(instances: List[Instance], interval: float,
                                  f"{fmt_money(cost.compute_per_hour, cost.currency)}/h compute){RESET}")
 
     lines.append("")
-    # Dedupe URLs (internal-DP engines all share one URL) and group their
-    # display names against it.
-    by_url_legend: Dict[str, List[str]] = {}
+    # Legend: one entry per URL. When the model is known, show it as the
+    # headline (it's already the row prefix) plus the engine count; otherwise
+    # fall back to listing the row names verbatim.
+    by_url_legend: Dict[str, List[Instance]] = {}
     for i in instances:
-        by_url_legend.setdefault(i.url.replace("/metrics", ""), []).append(i.name)
-    legend = "  ".join(
-        f"DP{','.join(names)}={url}" if len(names) == 1
-        else f"DP{{{','.join(names)}}}={url}"
-        for url, names in by_url_legend.items()
-    )
+        by_url_legend.setdefault(i.url.replace("/metrics", ""), []).append(i)
+    legend_parts = []
+    for url, insts in by_url_legend.items():
+        model = insts[0].model
+        n_eng = sum(1 for i in insts if i.engine is not None)
+        if model:
+            head = short_model_name(model)
+            suffix = f" ×{n_eng} engines" if n_eng > 1 else ""
+            legend_parts.append(f"{head}{suffix} @ {url}")
+        else:
+            names = [i.name for i in insts]
+            head = f"{{{','.join(names)}}}" if len(names) > 1 else names[0]
+            legend_parts.append(f"DP{head}={url}")
+    legend = "  ".join(legend_parts)
     lines.append(GRAY + "Legend: " + legend + RESET)
     lines.append(GRAY + "Ctrl-C to exit" + RESET)
     sys.stdout.write("\n".join(lines) + "\n")
     sys.stdout.flush()
+
+
+# ─────────────────────────── JSON output ────────────────────────────────
+def _replica_to_dict(inst: "Instance", smry: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    r: Dict[str, Any] = {
+        "name":   inst.name,
+        "url":    inst.url.replace("/metrics", ""),
+        "model":  inst.model,
+        "engine": inst.engine,
+        "status": "DOWN" if smry is None else ("STALE" if inst.error else "OK"),
+    }
+    if inst.error:
+        r["error"] = inst.error
+    if smry is None:
+        return r
+
+    r.update({
+        "running": smry["running"],
+        "waiting": smry["waiting"],
+        "swapped": smry["swapped"],
+        "kv_pct":  smry["kv_pct"],
+        "prefix_cache_hit_pct_window":   smry["cache_hit_pct"],
+        "prefix_cache_hit_pct_lifetime": smry["cache_hit_pct_life"],
+        "throughput": {
+            "prompt_tokens_per_s": smry["prompt_rps"],
+            "gen_tokens_per_s":    smry["gen_rps"],
+            "requests_per_s":      smry["req_rps"],
+        },
+        "latency_seconds": {
+            "ttft":  {"p50": smry["ttft_p50"], "p95": smry["ttft_p95"], "p99": smry["ttft_p99"],
+                      f"p95_{int(LONG_WINDOW_SECS)}s": smry["ttft_p95_long"]},
+            "tpot":  {"p50": smry["tpot_p50"], "p95": smry["tpot_p95"], "p99": smry["tpot_p99"],
+                      f"p95_{int(LONG_WINDOW_SECS)}s": smry["tpot_p95_long"]},
+            "e2e":   {"p50": smry["e2e_p50"],  "p95": smry["e2e_p95"],  "p99": smry["e2e_p99"],
+                      f"p95_{int(LONG_WINDOW_SECS)}s": smry["e2e_p95_long"]},
+            "queue": {"p95": smry["queue_p95"], f"p95_{int(LONG_WINDOW_SECS)}s": smry["queue_p95_long"]},
+        },
+    })
+
+    s = smry["_snap"]
+    def ctr(frag: str) -> Optional[float]:
+        n = find_metric(s.counters, frag)
+        return s.counters[n] if n else None
+    r["lifetime"] = {
+        "prompt_tokens_total":   ctr("prompt_tokens"),
+        "gen_tokens_total":      ctr("generation_tokens"),
+        "requests_total":        ctr("request_success"),
+        "prefix_cache_queries_total": ctr("prefix_cache_queries"),
+        "prefix_cache_hits_total":    ctr("prefix_cache_hits"),
+    }
+
+    if inst.first_seen is not None:
+        r["session"] = {
+            "first_seen_timestamp":     inst.first_seen,
+            "uptime_seconds":           time.time() - inst.first_seen,
+            "peak_running":             inst.peak_running,
+            "peak_waiting":             inst.peak_waiting,
+            "peak_swapped":             inst.peak_swapped,
+            "peak_kv_pct":              inst.peak_kv,
+            "peak_prompt_tokens_per_s": inst.peak_prompt_rps,
+            "peak_gen_tokens_per_s":    inst.peak_gen_rps,
+        }
+    return r
+
+
+def _cost_to_dict(instances: List["Instance"],
+                  summaries: List[Tuple["Instance", Optional[Dict[str, Any]]]],
+                  cost: "CostConfig") -> Dict[str, Any]:
+    out: Dict[str, Any] = {"currency": cost.currency}
+
+    def _counter(snap, frag):
+        n = find_metric(snap.counters, frag)
+        return snap.counters[n] if n else 0.0
+
+    if cost.token_enabled:
+        out["token_pricing"] = {
+            "input_usd_per_million":  cost.input_per_m,
+            "output_usd_per_million": cost.output_per_m,
+        }
+        sum_pin_life = sum_pout_life = 0.0
+        sess_p = sess_g = 0.0
+        for i in instances:
+            if i.snapshot is None:
+                continue
+            cp = _counter(i.snapshot, "prompt_tokens")
+            cg = _counter(i.snapshot, "generation_tokens")
+            sum_pin_life  += cp
+            sum_pout_life += cg
+            sess_p += max(0.0, cp - (i.baseline_prompt_tokens or cp))
+            sess_g += max(0.0, cg - (i.baseline_gen_tokens    or cg))
+        life_total, life_in, life_out = cost.for_tokens(sum_pin_life, sum_pout_life)
+        sess_total, _, _ = cost.for_tokens(sess_p, sess_g)
+        ok = [s for _, s in summaries if s is not None]
+        sum_pin_rate  = sum((s["prompt_rps"] or 0) for s in ok)
+        sum_pout_rate = sum((s["gen_rps"]    or 0) for s in ok)
+        per_sec, _, _ = cost.for_tokens(sum_pin_rate, sum_pout_rate)
+        out["token_based"] = {
+            "lifetime_total":     life_total,
+            "lifetime_input":     life_in,
+            "lifetime_output":    life_out,
+            "session_total":      sess_total,
+            "current_per_hour":   per_sec * 3600.0,
+        }
+
+    if cost.compute_enabled:
+        out["compute_pricing"] = {
+            "gpu_model":          cost.gpu_model,
+            "num_gpus":           cost.num_gpus,
+            "usd_per_gpu_hour":   cost.gpu_cost_hour,
+            "source":             cost.gpu_price_source,
+        }
+        first_seens = [i.first_seen for i in instances if i.first_seen is not None]
+        uptime = (time.time() - min(first_seens)) if first_seens else 0.0
+        vllm_up = vllm_uptime_seconds(instances)
+        out["compute_based"] = {
+            "burn_rate_per_hour": cost.compute_per_hour,
+            "session_total":      cost.for_seconds(uptime),
+            "lifetime_total":     cost.for_seconds(vllm_up) if vllm_up else None,
+            "vllm_uptime_seconds": vllm_up,
+        }
+
+    return out
+
+
+def build_json_payload(instances: List["Instance"], interval: float,
+                       cost: Optional["CostConfig"]) -> Dict[str, Any]:
+    """Build the per-poll JSON object emitted by `--output json`."""
+    summaries = [(i, summarize(i)) for i in instances]
+    n = len(instances)
+    up = sum(1 for i, s in summaries if s is not None and not i.error)
+
+    replicas = [_replica_to_dict(i, s) for i, s in summaries]
+
+    agg: Dict[str, Any] = {"up": up, "total": n}
+    ok_smries = [s for _, s in summaries if s is not None]
+    if ok_smries:
+        kvs = [s["kv_pct"] for s in ok_smries if s["kv_pct"] is not None]
+        agg.update({
+            "running_total": sum((s["running"] or 0) for s in ok_smries),
+            "waiting_total": sum((s["waiting"] or 0) for s in ok_smries),
+            "swapped_total": sum((s["swapped"] or 0) for s in ok_smries),
+            "kv_pct_max":    max(kvs) if kvs else None,
+            "prompt_tokens_per_s_total": sum((s["prompt_rps"] or 0) for s in ok_smries),
+            "gen_tokens_per_s_total":    sum((s["gen_rps"]    or 0) for s in ok_smries),
+        })
+        snaps_pairs = [(s["_snap"], s["_prev"]) for s in ok_smries]
+        for label, frag in [("ttft", "time_to_first_token"),
+                            ("tpot", "time_per_output_token"),
+                            ("e2e",  "e2e_request_latency")]:
+            b, c = merge_window_buckets(snaps_pairs, frag)
+            agg[f"latency_{label}_p95_seconds"] = histogram_percentile(b, c, 0.95)
+
+    payload: Dict[str, Any] = {
+        "timestamp":        time.time(),
+        "interval_seconds": interval,
+        "replicas":         replicas,
+        "aggregate":        agg,
+    }
+    if cost is not None and cost.enabled:
+        payload["cost"] = _cost_to_dict(instances, summaries, cost)
+    return payload
+
+
+def render_json(instances: List["Instance"], interval: float,
+                cost: Optional["CostConfig"] = None) -> None:
+    """Emit a single JSON object on stdout (newline-terminated → JSONL-friendly).
+
+    Designed to be piped to scripts, log files, or alerting pipelines:
+        vllm-htop --output json --interval 5 >> /var/log/vllm-htop.jsonl
+        vllm-htop --output json --once | jq '.aggregate.kv_pct_max'
+    """
+    print(json.dumps(build_json_payload(instances, interval, cost)), flush=True)
 
 
 # ──────────────────────── auto-discovery (--auto) ────────────────────────
@@ -1308,6 +1881,11 @@ def main() -> None:
                     help="force compact table view (default: auto — table when ≥2 URLs)")
     ap.add_argument("--detail",   action="store_true",
                     help="force per-replica detail view (only sensible for a single URL)")
+    ap.add_argument("--output",   choices=("auto", "table", "detail", "json"),
+                    default="auto",
+                    help="output mode. 'auto' picks table for ≥2 replicas else "
+                         "detail; 'json' emits a JSONL stream (one object per "
+                         "poll), suitable for piping to scripts.")
     ap.add_argument("--cost-in",  type=float, default=0.0, metavar="PRICE",
                     help="USD per 1M input (prompt) tokens — enables token-based "
                          "cost (e.g. 0.50 to model OpenAI-style pricing)")
@@ -1414,12 +1992,37 @@ def main() -> None:
               f"replica(s) (of which {n_engines} are engine splits)",
               file=sys.stderr, flush=True)
 
-    use_table = args.table or (len(instances) >= 2 and not args.detail)
+    # Resolve output mode. `--output` is the modern way; the legacy
+    # --table / --detail flags still win when set (backward compat).
+    if args.output == "json":
+        mode = "json"
+    elif args.table:
+        mode = "table"
+    elif args.detail:
+        mode = "detail"
+    elif args.output == "table":
+        mode = "table"
+    elif args.output == "detail":
+        mode = "detail"
+    else:
+        mode = "table" if len(instances) >= 2 else "detail"
+
+    # htop-style: claim the alternate screen buffer for the interactive loop
+    # so the monitor's frames don't pile up in the scrollback. Skip when the
+    # output is structured (JSON), one-shot (--once), or being captured
+    # (stdout isn't a tty — e.g. `vllm-htop > out.log` or `| tee`).
+    use_alt = (mode in ("table", "detail")
+               and not args.once
+               and sys.stdout.isatty())
+    if use_alt:
+        enter_alt_screen()
 
     try:
         while True:
             fetch_all(instances, timeout=args.timeout)
-            if use_table:
+            if mode == "json":
+                render_json(instances, interval=args.interval, cost=cost)
+            elif mode == "table":
                 render_table(instances, interval=args.interval, cost=cost)
             else:
                 render_detail(instances[0], cost=cost)
@@ -1427,7 +2030,9 @@ def main() -> None:
                 break
             time.sleep(args.interval)
     except KeyboardInterrupt:
-        print()
+        pass
+    finally:
+        leave_alt_screen()
 
 
 if __name__ == "__main__":

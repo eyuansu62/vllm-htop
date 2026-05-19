@@ -5,9 +5,33 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-05-19
+
+### Added
+- **Lifetime compute cost** in the Cost section's Compute-based subsection — computed from `process_start_time_seconds` (the standard prometheus_client metric vLLM auto-exports) × `$/h × N`. Symmetric with the token-based Lifetime row, both reflect "since the vLLM process started." JSON output exposes it as `cost.compute_based.lifetime_total` plus `vllm_uptime_seconds`. Falls back gracefully when the metric isn't available.
+
+### Changed
+- **Imbalance check redesigned** for actionability. Three concrete improvements:
+  - **Healthy case collapses to one line** (`✓ all N checks pass`) so the section disappears visually when nothing is wrong.
+  - **Outlier replica is named** in the warning (`Llama-3.1-8B.e3: 979ms is 5.2× median`) — no more cross-referencing the table above to identify which row is slow.
+  - **Median-based ratio** (`max / median`) instead of `max / min`. Robust to idle replicas that previously dragged `min` to zero and produced misleading 75× ratios. Threshold remains 1.5× since median is a stronger baseline.
+  - **Grouped by model**: each served model gets its own imbalance section, so mixed deployments (e.g. LLM + embedding) don't cross-compare workloads that are inherently different.
+- **htop-style alt-screen rendering** in interactive mode. The monitor now claims the terminal's alternate screen buffer for its lifetime (same mechanism as `htop`, `vim`, `less`) — successive refreshes overwrite the same fixed window rather than scrolling new frames into history, and the original terminal contents are restored on Ctrl-C. Falls back to plain printing when output is captured (`> out.log`, `| tee`), one-shot (`--once`), or in JSON mode, so pipelines and scripting are unaffected.
+
+### Added
+- **Long-window P95** in the detail view's Latency section: a new `P95@1m` column showing the percentile over the last ~60 seconds of accumulated histogram samples, alongside the existing noisy 2s `P95`. Bridges the gap between "what just happened" (twitchy, often `—`) and "lifetime average" (too smoothed). Backed by a 10-minute rolling snapshot buffer per replica. Configurable via `LONG_WINDOW_SECS` (planned: CLI flag).
+- **Prefix cache hit rate** — surfaced from `vllm:prefix_cache_queries_total` / `vllm:prefix_cache_hits_total` whenever vLLM exposes them. Shows up as a new `Cache%` column in the table view (with green ≥60% / yellow ≥30% / red threshold coloring), a windowed-and-lifetime line in the detail view's Saturation section, and a weighted-aggregate in the table's ALL row.
+- **JSON output mode** (`--output json`): emits one JSON object per poll on stdout, suitable for piping into scripts, log files, or alerting pipelines. Schema covers per-replica gauges, throughput, latency (incl. long-window P95), lifetime counters, session peaks, aggregate, and the Cost section.
+  ```bash
+  vllm-htop --output json --interval 5 >> /var/log/vllm-htop.jsonl
+  vllm-htop --output json --once | jq '.aggregate.kv_pct_max'
+  ```
+
 ## [0.2.2] — 2026-05-19
 
 ### Added
+- **Row names now use the served model name** when it can be extracted from `/metrics` labels (`model_name`, `served_model_name`, or `model`). E.g. an `LLM + embedding` two-process deployment shows up as `Llama-3.1-8B-Instruct.e0..e5` / `bge-large-zh-v1.5.e0..e1` instead of the previous `0.e0..0.e5` / `1.e0..1.e1`. Falls back to URL indices when (a) no model name is exposed, or (b) two URLs serve the same model (would create ambiguous duplicates).
+- Legend at the bottom of the table view is now model-centric: `Llama-3.1-8B-Instruct ×6 engines @ http://localhost:8000`, much more compact than listing every engine name.
 - GPU price table now covers NVIDIA's China-market Hopper variants (`H20-3e`, `H20`) and Ada variant (`L20`) — anchored to mainland-China rental rates (AutoDL / GpuMall / Aliyun mid-tier).
 
 ### Fixed
