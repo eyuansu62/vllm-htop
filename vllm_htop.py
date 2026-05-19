@@ -39,6 +39,7 @@ No third-party dependencies. Python 3.8+.
 import argparse
 import re
 import socket
+import subprocess
 import sys
 import time
 import urllib.request
@@ -47,7 +48,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
 
 
 # ───────────────────────────── ANSI styling ──────────────────────────────
@@ -220,6 +221,173 @@ def merge_window_buckets(snaps: List[Tuple[Snapshot, Optional[Snapshot]]], fragm
     return merged_b, merged_c
 
 
+# ─────────────────────────── cost model ─────────────────────────────────
+#
+# vllm-htop's Cost section supports two independent pricing models:
+#
+#   1. Token-based — opt-in via `--cost-in $/M` and `--cost-out $/M`.
+#      Estimates "what this inference would cost at API prices."
+#
+#   2. Compute-based — auto-detected when `nvidia-smi` is on PATH. Looks up
+#      the detected GPU model in a built-in price-hint table (community-market
+#      median rates) and multiplies uptime × GPU count × $/h. Always
+#      overridable via `--gpu-cost-hour` and `--num-gpus`.
+#
+# Both can be on simultaneously; the second is a useful cross-check on the
+# first ("am I charging enough to cover the GPUs?").
+#
+# Price hints below are anchored to **RunPod Secure tier** published rates
+# (2026-05 snapshot). Rationale: RunPod Secure is what OpenRouter-class
+# token-API providers (Lambda, Hyperbolic, DeepInfra, …) typically pay for
+# their compute, so it's the most representative "GPU rental cost" for
+# someone running their own vLLM serving stack.
+#
+# Cross-provider sanity check:
+#   - AWS / GCP on-demand: typically 3-5× higher than this table
+#   - Lambda Labs:         within ±10% of this table
+#   - RunPod Community:    typically 20-40% lower
+#   - vast.ai community:   often 30-50% lower (high variance)
+#
+# Substring match — longer/more-specific hints first (so "H100 NVL" hits
+# before plain "H100", "A100 80GB" before "A100", "RTX PRO 6000" before
+# "RTX A6000", etc.). Override with --gpu-cost-hour for anything serious.
+#
+# Format: (substring, $/h per GPU). Source notes in trailing comment.
+GPU_PRICE_HINTS: List[Tuple[str, float]] = [
+    # Datacenter — Blackwell (B-series, 2024-2025+)
+    ("GB200",         8.99),   # GB200 NVL72 per-GPU est; rarely sold standalone
+    ("B200",          5.99),   # RunPod Secure: B200 SXM5 192GB HBM3e
+    ("B100",          4.99),   # B100 PCIe variant
+    # Datacenter — Hopper (H-series)
+    ("H200",          3.99),   # RunPod Secure: H200 SXM5 141GB
+    ("H100 NVL",      3.69),   # RunPod Secure: H100 NVL 94GB
+    ("H100",          3.39),   # RunPod Secure: H100 80GB SXM5 / PCIe
+    # Datacenter — Ampere (A-series)
+    ("A100 80GB",     1.89),   # RunPod Secure
+    ("A100",          1.59),   # RunPod Secure: A100 40GB
+    ("A40",           0.79),   # RunPod Secure
+    ("A30",           0.49),
+    ("A10G",          0.79),   # AWS-only variant of A10
+    ("A10",           0.69),
+    # Datacenter — Ada Lovelace (L-series)
+    ("L40S",          1.19),   # RunPod Secure
+    ("L40",           0.99),
+    ("L4",            0.49),
+    # Datacenter — older (still common for hobby vLLM)
+    ("V100 32GB",     0.59),
+    ("V100",          0.49),
+    ("T4",            0.29),
+    # Workstation — Blackwell (RTX PRO + RTX 50-series)
+    ("RTX PRO 6000",  2.29),   # Blackwell workstation, 96GB
+    ("RTX 5090",      0.89),   # consumer Blackwell, 32GB GDDR7
+    ("RTX 5080",      0.55),
+    # Workstation — Ada (RTX 6000 ADA + RTX 40-series)
+    ("RTX 6000 ADA",  1.49),   # Ada workstation, 48GB
+    ("RTX 4090",      0.69),   # consumer Ada, 24GB
+    ("RTX 4080",      0.39),
+    # Workstation — Ampere (RTX A-series)
+    ("RTX A6000",     0.79),   # 48GB, Ampere workstation
+    ("RTX A5000",     0.59),
+    ("RTX A4000",     0.39),
+    # Older consumer (still seen in homelab vLLM)
+    ("RTX 3090",      0.34),   # 24GB Ampere consumer
+]
+
+
+def lookup_gpu_price(name: str) -> Optional[float]:
+    """Match a GPU name against the built-in hint table. First match wins.
+
+    Uses *token-set* matching, not raw substring: a hint like "A100 80GB"
+    splits into tokens {"A100", "80GB"} and matches if every token appears
+    anywhere in the GPU name. This handles both nvidia-smi conventions —
+    space-separated (`A100 80GB PCIe`) and hyphen-separated (`A100-SXM4-80GB`).
+    Hint ordering still matters: more specific hints must come first
+    (e.g. "A100 80GB" before plain "A100").
+    """
+    # Normalize: uppercase, swap separators for spaces, collapse whitespace.
+    haystack = " ".join(name.upper().replace("-", " ").split())
+    for hint, price in GPU_PRICE_HINTS:
+        # Each token must appear as a whole word — `(?<![A-Z0-9])TOKEN(?![A-Z0-9])`
+        # — so "A100" doesn't match "RTX A1000" and "L4" doesn't match "L40".
+        if all(re.search(rf"(?<![A-Z0-9]){re.escape(t)}(?![A-Z0-9])", haystack)
+               for t in hint.upper().split()):
+            return price
+    return None
+
+
+def detect_gpus(timeout: float = 2.0) -> Optional[Tuple[str, int]]:
+    """Best-effort GPU detection via nvidia-smi. Returns (model, count) or None.
+
+    Returns None when nvidia-smi isn't on PATH (e.g. CPU box, container without
+    GPU passthrough, AMD/Intel/Apple Silicon host). Caller handles fallback.
+    """
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=timeout, check=True,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return None
+    names = [ln.strip() for ln in result.stdout.splitlines() if ln.strip()]
+    if not names:
+        return None
+    # Most multi-GPU setups are homogeneous; return the first model as
+    # representative. Heterogeneous boxes are rare for vLLM serving anyway.
+    return names[0], len(names)
+
+
+@dataclass
+class CostConfig:
+    """Configures the ▸ Cost section. Either pricing model may be enabled."""
+    # Token pricing (opt-in via CLI)
+    input_per_m:  float = 0.0   # $ per 1M prompt tokens
+    output_per_m: float = 0.0   # $ per 1M generation tokens
+    currency:     str   = "$"
+    # Compute pricing (auto-detected or opt-in)
+    gpu_cost_hour: float = 0.0
+    num_gpus:      int   = 0
+    gpu_model:     Optional[str] = None     # informational, for display
+    gpu_price_source: str = ""              # "user" / "auto" / ""
+
+    @property
+    def token_enabled(self) -> bool:
+        return self.input_per_m > 0 or self.output_per_m > 0
+
+    @property
+    def compute_enabled(self) -> bool:
+        return self.gpu_cost_hour > 0 and self.num_gpus > 0
+
+    @property
+    def enabled(self) -> bool:
+        return self.token_enabled or self.compute_enabled
+
+    @property
+    def compute_per_hour(self) -> float:
+        return self.gpu_cost_hour * self.num_gpus
+
+    def for_tokens(self, prompt: float, gen: float) -> Tuple[float, float, float]:
+        """Return (total, input_cost, output_cost)."""
+        ic = (prompt or 0) * self.input_per_m  / 1_000_000.0
+        oc = (gen    or 0) * self.output_per_m / 1_000_000.0
+        return ic + oc, ic, oc
+
+    def for_seconds(self, secs: float) -> float:
+        """Compute cost for an interval of wallclock seconds (uses both GPUs and rate)."""
+        return self.compute_per_hour * (secs / 3600.0)
+
+
+def fmt_money(v: Optional[float], symbol: str = "$") -> str:
+    """Format a monetary value with thousands separators and adaptive precision."""
+    if v is None:
+        return "—"
+    av = abs(v)
+    if av >= 1000:   return f"{symbol}{v:,.2f}"
+    if av >= 1:      return f"{symbol}{v:.2f}"
+    if av >= 0.01:   return f"{symbol}{v:.4f}"
+    if av == 0:      return f"{symbol}0.00"
+    return f"{symbol}{v:.6f}"
+
+
 # ─────────────────────────── instance model ──────────────────────────────
 @dataclass
 class Instance:
@@ -243,6 +411,10 @@ class Instance:
     hist_gen_rps:    List[float] = field(default_factory=list)
     hist_ttft_p95:   List[float] = field(default_factory=list)  # ms
     hist_tpot_p95:   List[float] = field(default_factory=list)  # ms
+    # Cost-tracking baselines: counter values when the monitor first saw this
+    # replica, so "session cost" can subtract them from current totals.
+    baseline_prompt_tokens: Optional[float] = None
+    baseline_gen_tokens:    Optional[float] = None
 
 
 def fetch_metrics(url: str, timeout: float = 5.0) -> str:
@@ -258,6 +430,11 @@ def _update_session(inst: Instance) -> None:
         return
     if inst.first_seen is None:
         inst.first_seen = s.timestamp
+        # Snapshot baseline counters so "this session" cost can be derived later.
+        pn = find_metric(s.counters, "prompt_tokens")
+        gn = find_metric(s.counters, "generation_tokens")
+        if pn: inst.baseline_prompt_tokens = s.counters[pn]
+        if gn: inst.baseline_gen_tokens    = s.counters[gn]
 
     # Peak gauges (current absolute values)
     def gauge(frag: str) -> Optional[float]:
@@ -465,7 +642,7 @@ def _wait_color(w: Optional[float]) -> str:
     return RED if w > 5 else YELLOW
 
 
-def render_detail(inst: Instance) -> None:
+def render_detail(inst: Instance, cost: Optional[CostConfig] = None) -> None:
     """Full detail view for a single instance (P50/P95/P99 × 4 latency metrics)."""
     s = inst.snapshot
     p = inst.prev
@@ -593,12 +770,72 @@ def render_detail(inst: Instance) -> None:
             lines.append(f"  Peak out tok/s(sess): {BOLD}{inst.peak_gen_rps:>10.0f}{RESET}")
         lines.append("")
 
+    # ── Cost (when any pricing model is enabled) ──
+    if cost is not None and cost.enabled and s is not None:
+        def ctr(frag: str) -> Optional[float]:
+            n = find_metric(s.counters, frag)
+            return s.counters[n] if n else None
+
+        uptime = (time.time() - inst.first_seen) if inst.first_seen else 0.0
+        lines.append(f"{BOLD}▸ Cost{RESET}  {DIM}(estimated){RESET}")
+
+        # Token-based pricing
+        if cost.token_enabled:
+            p_life = ctr("prompt_tokens")     or 0.0
+            g_life = ctr("generation_tokens") or 0.0
+            life_total, life_in, life_out = cost.for_tokens(p_life, g_life)
+            lines.append(f"  {DIM}Token-based  ({cost.currency}{cost.input_per_m:g}/M in, "
+                         f"{cost.currency}{cost.output_per_m:g}/M out){RESET}")
+            lines.append(f"    Lifetime         : {BOLD}{fmt_money(life_total, cost.currency):>12}{RESET}  "
+                         f"{DIM}({fmt_money(life_in, cost.currency)} in + "
+                         f"{fmt_money(life_out, cost.currency)} out){RESET}")
+            if inst.baseline_prompt_tokens is not None or inst.baseline_gen_tokens is not None:
+                sess_p = max(0.0, p_life - (inst.baseline_prompt_tokens or 0.0))
+                sess_g = max(0.0, g_life - (inst.baseline_gen_tokens    or 0.0))
+                sess_total, _, _ = cost.for_tokens(sess_p, sess_g)
+                lines.append(f"    This session     : {BOLD}{fmt_money(sess_total, cost.currency):>12}{RESET}  "
+                             f"{DIM}(over {fmt_duration(uptime)}){RESET}")
+            smry_now = summarize(inst)
+            if smry_now and smry_now["prompt_rps"] is not None and smry_now["gen_rps"] is not None:
+                per_sec, _, _ = cost.for_tokens(smry_now["prompt_rps"], smry_now["gen_rps"])
+                if per_sec > 0:
+                    lines.append(f"    Current rate     : {BOLD}{fmt_money(per_sec*60, cost.currency):>12}/min{RESET}  "
+                                 f"{DIM}({fmt_money(per_sec*3600, cost.currency)}/hour at current throughput){RESET}")
+
+        # Compute-based pricing
+        if cost.compute_enabled:
+            src = (" — RunPod Secure reference, ±30% across providers"
+                   if cost.gpu_price_source == "auto" else "")
+            model = cost.gpu_model or "GPU"
+            lines.append(f"  {DIM}Compute-based  ({model} × {cost.num_gpus} @ "
+                         f"{cost.currency}{cost.gpu_cost_hour:g}/h{src}){RESET}")
+            lines.append(f"    Burn rate        : {BOLD}{fmt_money(cost.compute_per_hour, cost.currency):>12}/hour{RESET}  "
+                         f"{DIM}(paid whether busy or idle){RESET}")
+            lines.append(f"    This session     : {BOLD}{fmt_money(cost.for_seconds(uptime), cost.currency):>12}{RESET}  "
+                         f"{DIM}(over {fmt_duration(uptime)}){RESET}")
+
+        # Margin: only sensible when BOTH are enabled
+        if cost.token_enabled and cost.compute_enabled:
+            smry_now = summarize(inst)
+            if smry_now and smry_now["prompt_rps"] is not None and smry_now["gen_rps"] is not None:
+                revenue_per_sec, _, _ = cost.for_tokens(smry_now["prompt_rps"], smry_now["gen_rps"])
+                cost_per_sec = cost.compute_per_hour / 3600.0
+                if cost_per_sec > 0:
+                    ratio = revenue_per_sec / cost_per_sec
+                    color = GREEN if ratio >= 2.0 else YELLOW if ratio >= 1.0 else RED
+                    lines.append(f"  {DIM}Margin (token revenue ÷ compute cost){RESET}")
+                    lines.append(f"    At current load  : {color}{BOLD}{ratio:>10.2f}×{RESET}  "
+                                 f"{DIM}({fmt_money(revenue_per_sec*3600, cost.currency)}/h revenue vs "
+                                 f"{fmt_money(cost.compute_per_hour, cost.currency)}/h compute){RESET}")
+        lines.append("")
+
     lines.append(GRAY + "Ctrl-C to exit" + RESET)
     sys.stdout.write("\n".join(lines) + "\n")
     sys.stdout.flush()
 
 
-def render_table(instances: List[Instance], interval: float) -> None:
+def render_table(instances: List[Instance], interval: float,
+                 cost: Optional[CostConfig] = None) -> None:
     """Per-DP comparison table + aggregate row + imbalance check."""
     summaries = [(inst, summarize(inst)) for inst in instances]
     n = len(instances)
@@ -761,6 +998,70 @@ def render_table(instances: List[Instance], interval: float) -> None:
             f"{BOLD}{humanize(sum_req_life):>9}{RESET}"
         )
 
+        # ── Cost (when any pricing model is enabled) ──
+        if cost is not None and cost.enabled:
+            def _counter(snap: Snapshot, frag: str) -> float:
+                n = find_metric(snap.counters, frag)
+                return snap.counters[n] if n else 0.0
+
+            ok_smries = [s for s in (summarize(i) for i in instances) if s is not None]
+
+            lines.append("")
+            lines.append(f"{BOLD}▸ Cost{RESET}  "
+                         f"{DIM}(estimated · sum across {len(instances)} replicas){RESET}")
+
+            # Token-based
+            if cost.token_enabled:
+                life_total, life_in, life_out = cost.for_tokens(sum_pin_life, sum_pout_life)
+                sess_p = sess_g = 0.0
+                for i in instances:
+                    if i.snapshot is None:
+                        continue
+                    cur_p = _counter(i.snapshot, "prompt_tokens")
+                    cur_g = _counter(i.snapshot, "generation_tokens")
+                    sess_p += max(0.0, cur_p - (i.baseline_prompt_tokens or cur_p))
+                    sess_g += max(0.0, cur_g - (i.baseline_gen_tokens    or cur_g))
+                sess_total, _, _ = cost.for_tokens(sess_p, sess_g)
+                sum_pin_rate  = sum((s["prompt_rps"] or 0) for s in ok_smries)
+                sum_pout_rate = sum((s["gen_rps"]    or 0) for s in ok_smries)
+                per_sec, _, _ = cost.for_tokens(sum_pin_rate, sum_pout_rate)
+
+                lines.append(f"  {DIM}Token-based  ({cost.currency}{cost.input_per_m:g}/M in, "
+                             f"{cost.currency}{cost.output_per_m:g}/M out){RESET}")
+                lines.append(f"    Lifetime     : {BOLD}{fmt_money(life_total, cost.currency):>12}{RESET}  "
+                             f"{DIM}({fmt_money(life_in, cost.currency)} in + "
+                             f"{fmt_money(life_out, cost.currency)} out){RESET}")
+                lines.append(f"    This session : {BOLD}{fmt_money(sess_total, cost.currency):>12}{RESET}  "
+                             f"{DIM}(over {fmt_duration(uptime)}){RESET}")
+                if per_sec > 0:
+                    lines.append(f"    Current rate : {BOLD}{fmt_money(per_sec*60, cost.currency):>12}/min{RESET}  "
+                                 f"{DIM}({fmt_money(per_sec*3600, cost.currency)}/hour at current throughput){RESET}")
+
+            # Compute-based
+            if cost.compute_enabled:
+                src = " — auto-detected, estimate" if cost.gpu_price_source == "auto" else ""
+                model = cost.gpu_model or "GPU"
+                lines.append(f"  {DIM}Compute-based  ({model} × {cost.num_gpus} @ "
+                             f"{cost.currency}{cost.gpu_cost_hour:g}/h{src}){RESET}")
+                lines.append(f"    Burn rate    : {BOLD}{fmt_money(cost.compute_per_hour, cost.currency):>12}/hour{RESET}  "
+                             f"{DIM}(paid whether busy or idle){RESET}")
+                lines.append(f"    This session : {BOLD}{fmt_money(cost.for_seconds(uptime), cost.currency):>12}{RESET}  "
+                             f"{DIM}(over {fmt_duration(uptime)}){RESET}")
+
+            # Margin: token revenue vs compute cost
+            if cost.token_enabled and cost.compute_enabled and ok_smries:
+                sum_pin_rate  = sum((s["prompt_rps"] or 0) for s in ok_smries)
+                sum_pout_rate = sum((s["gen_rps"]    or 0) for s in ok_smries)
+                revenue_per_sec, _, _ = cost.for_tokens(sum_pin_rate, sum_pout_rate)
+                cost_per_sec = cost.compute_per_hour / 3600.0
+                if cost_per_sec > 0:
+                    ratio = revenue_per_sec / cost_per_sec
+                    color = GREEN if ratio >= 2.0 else YELLOW if ratio >= 1.0 else RED
+                    lines.append(f"  {DIM}Margin (token revenue ÷ compute cost){RESET}")
+                    lines.append(f"    At current load : {color}{BOLD}{ratio:>9.2f}×{RESET}  "
+                                 f"{DIM}({fmt_money(revenue_per_sec*3600, cost.currency)}/h revenue vs "
+                                 f"{fmt_money(cost.compute_per_hour, cost.currency)}/h compute){RESET}")
+
     lines.append("")
     legend = "  ".join(f"DP{i.name}={i.url.replace('/metrics','')}" for i in instances)
     lines.append(GRAY + "Legend: " + legend + RESET)
@@ -879,7 +1180,57 @@ def main() -> None:
                     help="force compact table view (default: auto — table when ≥2 URLs)")
     ap.add_argument("--detail",   action="store_true",
                     help="force per-replica detail view (only sensible for a single URL)")
+    ap.add_argument("--cost-in",  type=float, default=0.0, metavar="PRICE",
+                    help="USD per 1M input (prompt) tokens — enables token-based "
+                         "cost (e.g. 0.50 to model OpenAI-style pricing)")
+    ap.add_argument("--cost-out", type=float, default=0.0, metavar="PRICE",
+                    help="USD per 1M output (generation) tokens")
+    ap.add_argument("--gpu-cost-hour", type=float, default=0.0, metavar="PRICE",
+                    help="USD per GPU per hour for compute-based cost. "
+                         "If omitted, vllm-htop tries `nvidia-smi` and looks up "
+                         "a built-in price hint; use this flag to override.")
+    ap.add_argument("--num-gpus", type=int, default=0, metavar="N",
+                    help="GPU count for compute-based cost. Default: count from "
+                         "nvidia-smi, falling back to the number of monitored replicas.")
+    ap.add_argument("--no-gpu-detect", action="store_true",
+                    help="skip nvidia-smi auto-detection (use only explicit "
+                         "--gpu-cost-hour / --num-gpus)")
+    ap.add_argument("--currency", default="$",
+                    help="currency symbol shown in the Cost section (default: $)")
     args = ap.parse_args()
+
+    # Token pricing — purely from flags
+    token_in  = max(0.0, args.cost_in)
+    token_out = max(0.0, args.cost_out)
+
+    # Compute pricing — explicit flag > nvidia-smi auto-detect
+    gpu_cost   = max(0.0, args.gpu_cost_hour)
+    num_gpus   = max(0, args.num_gpus)
+    gpu_model: Optional[str] = None
+    price_src  = "user" if gpu_cost > 0 else ""
+
+    if not args.no_gpu_detect and (gpu_cost == 0 or num_gpus == 0 or gpu_model is None):
+        detected = detect_gpus()
+        if detected is not None:
+            det_model, det_count = detected
+            gpu_model = det_model
+            if num_gpus == 0:
+                num_gpus = det_count
+            if gpu_cost == 0:
+                hint = lookup_gpu_price(det_model)
+                if hint is not None:
+                    gpu_cost = hint
+                    price_src = "auto"
+
+    cost = CostConfig(
+        input_per_m=token_in,
+        output_per_m=token_out,
+        currency=args.currency,
+        gpu_cost_hour=gpu_cost,
+        num_gpus=num_gpus,
+        gpu_model=gpu_model,
+        gpu_price_source=price_src,
+    )
 
     if args.auto and args.url:
         sys.exit("--auto and --url are mutually exclusive")
@@ -932,9 +1283,9 @@ def main() -> None:
         while True:
             fetch_all(instances, timeout=args.timeout)
             if use_table:
-                render_table(instances, interval=args.interval)
+                render_table(instances, interval=args.interval, cost=cost)
             else:
-                render_detail(instances[0])
+                render_detail(instances[0], cost=cost)
             if args.once:
                 break
             time.sleep(args.interval)
