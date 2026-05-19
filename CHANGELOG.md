@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **Imbalance check redesigned** for actionability. Three concrete improvements:
   - **Healthy case collapses to one line** (`✓ all N checks pass`) so the section disappears visually when nothing is wrong.
-  - **Outlier replica is named** in the warning (`Llama-3.1-8B.e3: 979ms is 5.2× median`) — no more cross-referencing the table above to identify which row is slow.
+  - **Outlier replica is named** in the warning (`<model>.e3: 979ms is 5.2× median`) — no more cross-referencing the table above to identify which row is slow.
   - **Median-based ratio** (`max / median`) instead of `max / min`. Robust to idle replicas that previously dragged `min` to zero and produced misleading 75× ratios. Threshold remains 1.5× since median is a stronger baseline.
   - **Grouped by model**: each served model gets its own imbalance section, so mixed deployments (e.g. LLM + embedding) don't cross-compare workloads that are inherently different.
 - **htop-style alt-screen rendering** in interactive mode. The monitor now claims the terminal's alternate screen buffer for its lifetime (same mechanism as `htop`, `vim`, `less`) — successive refreshes overwrite the same fixed window rather than scrolling new frames into history, and the original terminal contents are restored on Ctrl-C. Falls back to plain printing when output is captured (`> out.log`, `| tee`), one-shot (`--once`), or in JSON mode, so pipelines and scripting are unaffected.
@@ -30,8 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.2.2] — 2026-05-19
 
 ### Added
-- **Row names now use the served model name** when it can be extracted from `/metrics` labels (`model_name`, `served_model_name`, or `model`). E.g. an `LLM + embedding` two-process deployment shows up as `Llama-3.1-8B-Instruct.e0..e5` / `bge-large-zh-v1.5.e0..e1` instead of the previous `0.e0..0.e5` / `1.e0..1.e1`. Falls back to URL indices when (a) no model name is exposed, or (b) two URLs serve the same model (would create ambiguous duplicates).
-- Legend at the bottom of the table view is now model-centric: `Llama-3.1-8B-Instruct ×6 engines @ http://localhost:8000`, much more compact than listing every engine name.
+- **Row names now use the served model name** when it can be extracted from `/metrics` labels (`model_name`, `served_model_name`, or `model`). E.g. an `LLM + embedding` two-process deployment shows up as `<llm-model>.e0..e5` / `<embed-model>.e0..e1` instead of the previous `0.e0..0.e5` / `1.e0..1.e1`. Falls back to URL indices when (a) no model name is exposed, or (b) two URLs serve the same model (would create ambiguous duplicates).
+- Legend at the bottom of the table view is now model-centric: `<model> ×6 engines @ http://localhost:8000`, much more compact than listing every engine name.
 - GPU price table now covers NVIDIA's China-market Hopper variants (`H20-3e`, `H20`) and Ada variant (`L20`) — anchored to mainland-China rental rates (AutoDL / GpuMall / Aliyun mid-tier).
 
 ### Fixed

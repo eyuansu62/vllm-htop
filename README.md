@@ -8,46 +8,15 @@
 
 Zero dependencies. Single file. Python 3.8+.
 
-```
-vLLM DP Monitor  │  8/8 up  │  2026-05-19 14:23:01  (interval=2.0s)
-──────────────────────────────────────────────────────────────────────────────────────────────────────────
- DP                          Status   Run  Wait  Swap   KV%   Cache%   in tok/s  out tok/s   TTFT-P95  TPOT-P95
-──────────────────────────────────────────────────────────────────────────────────────────────────────────
- Llama-3.1-8B-Instruct.e0   OK         12    0     —   55.0%    78%       49793      16597       410ms     37.0ms
- Llama-3.1-8B-Instruct.e1   OK         11    0     —   58.0%    82%       47841      15947       415ms     38.0ms
- Llama-3.1-8B-Instruct.e2   OK         18    6     —   91.0%    65%       69738      23246       820ms     52.0ms
- Llama-3.1-8B-Instruct.e3   OK         12    0     —   57.0%    79%       48100      16100       420ms     38.0ms
- bge-large-zh-v1.5.e0       OK          3    0     —    8.0%     —           0       1234         —ms      —ms
- bge-large-zh-v1.5.e1       OK          3    0     —    8.0%     —           0       1198         —ms      —ms
-──────────────────────────────────────────────────────────────────────────────────────────────────────────
- ALL                                    59    6     0   max91%   76%      215472      71890       512ms     41.0ms
-
-▸ Imbalance check  Llama-3.1-8B-Instruct  (× 4 replicas)  ⚠ 1/4 failed
-  ✓ Running req          range 11–18, median 12
-  ✓ KV cache             range 55.0%–91.0%
-  ⚠ slow-replica (TTFT)  Llama-3.1-8B-Instruct.e2: 820ms is 2.0× median (410ms)
-  ✓ slow-decode (TPOT)   median 38.0ms, max 52.0ms (1.4×)
-
-▸ Imbalance check  bge-large-zh-v1.5  (× 2 replicas)  ✓ all 3 checks pass
-
-▸ Cost  (estimated)
-  Token-based  ($0.5/M in, $1.5/M out)
-    Lifetime         :     $165.17  ($75.08 in + $90.09 out)
-    This session     :       $0.13  (since vllm-htop attached)
-    Current rate     :       $3.86/min  ($231.55/hour at current throughput)
-  Compute-based  (NVIDIA H100 80GB × 8 @ $3.39/h — RunPod Secure reference)
-    Burn rate        :      $27.12/hour  (paid whether busy or idle)
-    Lifetime         :      $54.24      (over 2h00m of vLLM uptime)
-    This session     :       $0.92      (over 2m11s)
-  Margin (token revenue ÷ compute cost)
-    At current load  :       8.54×  ($231.55/h revenue vs $27.12/h compute)
-```
+<p align="center">
+  <img src="docs/screenshot.svg" alt="vllm-htop terminal screenshot showing the DP table with per-engine rows, prefix cache hit rate column, imbalance check identifying the slow replica, and cost section with margin row" width="900">
+</p>
 
 ## At a glance
 
 - **Auto-discovers** vLLM endpoints on the host — no `--url` needed for typical local setups
 - **Auto-splits internal DP** — `vllm serve --data-parallel-size N` becomes N rows automatically
-- **Model-aware row names** — `Llama-3.1-8B.e0` instead of `0.e0`, so mixed deployments (LLM + embedding) are readable
+- **Model-aware row names** — `<model>.e0` instead of `0.e0`, so mixed deployments (LLM + embedding) are readable
 - **Windowed + long-window percentiles** — P50/P95/P99 over ~2s, plus stabilized `P95@1m` for SLO reads
 - **Prefix cache hit rate** column when vLLM exposes it
 - **Imbalance check** that points to the bad replica by name, median-based and grouped by model
@@ -126,7 +95,7 @@ Row naming chooses the most informative form available:
 | External DP (N URLs, no engine) | `0`, `1`, … |
 | Internal DP (1 URL, N engines) | `e0`, `e1`, … |
 | Mixed (M URLs × N engines each) | `0.e0`, `0.e1`, `1.e0`, … |
-| Model name extractable from labels | `Llama-3.1-8B-Instruct.e0`, `bge-large-zh.e1`, … |
+| Model name extractable from labels | `<model>.e0`, `<other-model>.e1`, … |
 
 When `model_name` labels are present and distinct across URLs, the names use the model — so multi-model deployments (e.g. LLM + embedding on the same host) are readable at a glance. On name collisions (two URLs serving the same model) the tool falls back to URL indices to keep rows unique.
 
@@ -138,7 +107,7 @@ When ≥2 replicas serve the same model, `vllm-htop` runs four checks for cross-
 ▸ Imbalance check  (× 4 replicas)  ⚠ 1/4 failed
   ✓ Running req          range 5–8, median 6
   ✓ KV cache             range 40.0%–46.0%
-  ⚠ slow-replica (TTFT)  Llama-3.1-8B.e3: 979ms is 5.2× median (188ms)
+  ⚠ slow-replica (TTFT)  &lt;model&gt;.e3: 979ms is 5.2× median (188ms)
   ✓ slow-decode (TPOT)   median 38.0ms, max 52.0ms (1.4×)
 ```
 

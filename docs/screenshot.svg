@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 940 760" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, 'Cascadia Mono', 'JetBrains Mono', monospace">
+  <defs>
+    <filter id="shadow" x="-5%" y="-5%" width="110%" height="115%">
+      <feDropShadow dx="0" dy="6" stdDeviation="10" flood-opacity="0.4"/>
+    </filter>
+  </defs>
+
+  <!-- Terminal window -->
+  <rect x="10" y="10" width="920" height="740" rx="10" fill="#1e1f29" filter="url(#shadow)"/>
+
+  <!-- Title bar -->
+  <rect x="10" y="10" width="920" height="32" rx="10" fill="#2a2c39"/>
+  <rect x="10" y="32" width="920" height="10" fill="#2a2c39"/>
+  <circle cx="32" cy="26" r="6" fill="#ff5f57"/>
+  <circle cx="52" cy="26" r="6" fill="#febc2e"/>
+  <circle cx="72" cy="26" r="6" fill="#28c840"/>
+  <text x="470" y="30" text-anchor="middle" fill="#6c6f80" font-size="12">vllm-htop · ssh production-h100</text>
+
+  <!-- Content -->
+  <g font-size="13" xml:space="preserve">
+    <text x="30" y="68" fill="#abb2bf">
+      <tspan fill="#56b6c2" font-weight="bold">vLLM DP Monitor</tspan>
+      <tspan fill="#4a4d5d">  │  </tspan>
+      <tspan fill="#98c379">8/8 up</tspan>
+      <tspan fill="#4a4d5d">  │  </tspan>
+      <tspan fill="#abb2bf">2026-05-19 14:23:01</tspan>
+      <tspan fill="#4a4d5d">  (interval=2.0s)</tspan>
+    </text>
+
+    <text x="30" y="86" fill="#4a4d5d">────────────────────────────────────────────────────────────────────────────────────────</text>
+
+    <text x="30" y="104" fill="#5c6370" font-size="12">  DP             Status   Run  Wait   KV%    Cache%    in tok/s  out tok/s   TTFT-P95  TPOT-P95</text>
+    <text x="30" y="118" fill="#4a4d5d">────────────────────────────────────────────────────────────────────────────────────────</text>
+
+    <text x="30" y="138" fill="#abb2bf">  model-A.e0     <tspan fill="#98c379">OK</tspan>      12     0   <tspan fill="#abb2bf">55.0%</tspan>     <tspan fill="#98c379">78%</tspan>       49793      16597       <tspan fill="#abb2bf">410ms</tspan>     <tspan fill="#abb2bf">37.0ms</tspan></text>
+    <text x="30" y="156" fill="#abb2bf">  model-A.e1     <tspan fill="#98c379">OK</tspan>      11     0   <tspan fill="#abb2bf">58.0%</tspan>     <tspan fill="#98c379">82%</tspan>       47841      15947       <tspan fill="#abb2bf">415ms</tspan>     <tspan fill="#abb2bf">38.0ms</tspan></text>
+    <text x="30" y="174" fill="#abb2bf">  model-A.e2     <tspan fill="#98c379">OK</tspan>      18     <tspan fill="#e5c07b">6</tspan>   <tspan fill="#e06c75" font-weight="bold">91.0%</tspan>     <tspan fill="#e5c07b">65%</tspan>       69738      23246       <tspan fill="#e06c75" font-weight="bold">820ms</tspan>     <tspan fill="#e5c07b">52.0ms</tspan></text>
+    <text x="30" y="192" fill="#abb2bf">  model-A.e3     <tspan fill="#98c379">OK</tspan>      12     0   <tspan fill="#abb2bf">57.0%</tspan>     <tspan fill="#98c379">79%</tspan>       48100      16100       <tspan fill="#abb2bf">420ms</tspan>     <tspan fill="#abb2bf">38.0ms</tspan></text>
+
+    <text x="30" y="216" fill="#abb2bf">  model-B.e0     <tspan fill="#98c379">OK</tspan>       3     0    <tspan fill="#abb2bf">8.0%</tspan>      <tspan fill="#5c6370">—</tspan>           <tspan fill="#5c6370">0</tspan>       <tspan fill="#abb2bf">1234</tspan>         <tspan fill="#5c6370">—ms</tspan>      <tspan fill="#5c6370">—ms</tspan></text>
+    <text x="30" y="234" fill="#abb2bf">  model-B.e1     <tspan fill="#98c379">OK</tspan>       3     0    <tspan fill="#abb2bf">8.0%</tspan>      <tspan fill="#5c6370">—</tspan>           <tspan fill="#5c6370">0</tspan>       <tspan fill="#abb2bf">1198</tspan>         <tspan fill="#5c6370">—ms</tspan>      <tspan fill="#5c6370">—ms</tspan></text>
+
+    <text x="30" y="252" fill="#4a4d5d">────────────────────────────────────────────────────────────────────────────────────────</text>
+
+    <text x="30" y="270" fill="#abb2bf">  <tspan fill="#ffffff" font-weight="bold">ALL</tspan>                      59     <tspan fill="#e5c07b">6</tspan>   <tspan fill="#5c6370">max</tspan><tspan fill="#e06c75" font-weight="bold">91%</tspan>     <tspan fill="#98c379">76%</tspan>      215472      71890       <tspan fill="#abb2bf">512ms</tspan>     <tspan fill="#abb2bf">41.0ms</tspan></text>
+
+    <text x="30" y="304" fill="#abb2bf"><tspan font-weight="bold">▸ Imbalance check</tspan>  <tspan fill="#abb2bf">model-A</tspan>  <tspan fill="#5c6370">(× 4 replicas)</tspan>  <tspan fill="#e5c07b">⚠ 1/4 failed</tspan></text>
+    <text x="30" y="322" fill="#abb2bf">  <tspan fill="#98c379">✓</tspan> Running req          range 11–18, median 12</text>
+    <text x="30" y="340" fill="#abb2bf">  <tspan fill="#98c379">✓</tspan> KV cache             range 55.0%–91.0%</text>
+    <text x="30" y="358" fill="#abb2bf">  <tspan fill="#e06c75">⚠</tspan> slow-replica (TTFT)  <tspan fill="#ffffff" font-weight="bold">model-A.e2</tspan>: <tspan fill="#e06c75">820ms is 2.0× median (410ms)</tspan></text>
+    <text x="30" y="376" fill="#abb2bf">  <tspan fill="#98c379">✓</tspan> slow-decode (TPOT)   median 38.0ms, max 52.0ms (1.4×)</text>
+
+    <text x="30" y="404" fill="#abb2bf"><tspan font-weight="bold">▸ Imbalance check</tspan>  <tspan fill="#abb2bf">model-B</tspan>  <tspan fill="#5c6370">(× 2 replicas)</tspan>  <tspan fill="#98c379">✓ all 3 checks pass</tspan></text>
+
+    <text x="30" y="436" fill="#abb2bf"><tspan font-weight="bold">▸ Cost</tspan>  <tspan fill="#5c6370">(estimated)</tspan></text>
+    <text x="30" y="454" fill="#abb2bf">  <tspan fill="#5c6370">Token-based  ($0.5/M in, $1.5/M out)</tspan></text>
+    <text x="30" y="472" fill="#abb2bf">    Lifetime         :     <tspan fill="#ffffff" font-weight="bold">$165.17</tspan>   <tspan fill="#5c6370">($75.08 in + $90.09 out)</tspan></text>
+    <text x="30" y="490" fill="#abb2bf">    This session     :       <tspan fill="#ffffff" font-weight="bold">$0.13</tspan>   <tspan fill="#5c6370">(over 2m11s)</tspan></text>
+    <text x="30" y="508" fill="#abb2bf">    Current rate     :       <tspan fill="#ffffff" font-weight="bold">$3.86/min</tspan>   <tspan fill="#5c6370">($231.55/hour at current throughput)</tspan></text>
+    <text x="30" y="528" fill="#abb2bf">  <tspan fill="#5c6370">Compute-based  (NVIDIA H100 80GB × 8 @ $3.39/h — RunPod Secure reference)</tspan></text>
+    <text x="30" y="546" fill="#abb2bf">    Burn rate        :      <tspan fill="#ffffff" font-weight="bold">$27.12/hour</tspan>   <tspan fill="#5c6370">(paid whether busy or idle)</tspan></text>
+    <text x="30" y="564" fill="#abb2bf">    Lifetime         :      <tspan fill="#ffffff" font-weight="bold">$54.24</tspan>     <tspan fill="#5c6370">(over 2h00m of vLLM uptime)</tspan></text>
+    <text x="30" y="582" fill="#abb2bf">    This session     :       <tspan fill="#ffffff" font-weight="bold">$0.92</tspan>     <tspan fill="#5c6370">(over 2m11s)</tspan></text>
+    <text x="30" y="602" fill="#abb2bf">  <tspan fill="#5c6370">Margin (token revenue ÷ compute cost)</tspan></text>
+    <text x="30" y="620" fill="#abb2bf">    At current load  :       <tspan fill="#98c379" font-weight="bold">8.54×</tspan>   <tspan fill="#5c6370">($231.55/h revenue vs $27.12/h compute)</tspan></text>
+
+    <text x="30" y="654" fill="#5c6370" font-size="12">Legend: model-A ×4 engines @ http://localhost:8000   model-B ×2 engines @ http://localhost:8001</text>
+    <text x="30" y="672" fill="#5c6370" font-size="12">Ctrl-C to exit</text>
+
+    <text x="910" y="722" text-anchor="end" fill="#3a3c4a" font-size="11" font-style="italic">vllm-htop · 0.3.0 · htop for vLLM</text>
+  </g>
+</svg>
