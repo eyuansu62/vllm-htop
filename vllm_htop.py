@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "0.2.1"
+__version__ = "0.2.2"
 
 
 # ───────────────────────────── ANSI styling ──────────────────────────────
@@ -296,6 +296,10 @@ GPU_PRICE_HINTS: List[Tuple[str, float]] = [
     ("H200",          3.99),   # RunPod Secure: H200 SXM5 141GB
     ("H100 NVL",      3.69),   # RunPod Secure: H100 NVL 94GB
     ("H100",          3.39),   # RunPod Secure: H100 80GB SXM5 / PCIe
+    # Datacenter — Hopper, China-market export-compliant variants
+    # (anchored to mainland-China rental rates: AutoDL/GpuMall/Aliyun mid-tier)
+    ("H20-3E",        3.50),   # H20 with HBM3e, 96/141GB; ~¥25/h on AutoDL
+    ("H20",           2.80),   # original H20 96GB HBM3; ~¥20/h on AutoDL
     # Datacenter — Ampere (A-series)
     ("A100 80GB",     1.89),   # RunPod Secure
     ("A100",          1.59),   # RunPod Secure: A100 40GB
@@ -306,6 +310,7 @@ GPU_PRICE_HINTS: List[Tuple[str, float]] = [
     # Datacenter — Ada Lovelace (L-series)
     ("L40S",          1.19),   # RunPod Secure
     ("L40",           0.99),
+    ("L20",           0.99),   # China-market Ada variant (~L40 perf, 48GB)
     ("L4",            0.49),
     # Datacenter — older (still common for hobby vLLM)
     ("V100 32GB",     0.59),
@@ -333,18 +338,21 @@ def lookup_gpu_price(name: str) -> Optional[float]:
 
     Uses *token-set* matching, not raw substring: a hint like "A100 80GB"
     splits into tokens {"A100", "80GB"} and matches if every token appears
-    anywhere in the GPU name. This handles both nvidia-smi conventions —
-    space-separated (`A100 80GB PCIe`) and hyphen-separated (`A100-SXM4-80GB`).
+    anywhere in the GPU name. Both `-` and spaces count as token separators
+    on both sides, so this handles all nvidia-smi conventions:
+    `A100 80GB PCIe`, `A100-SXM4-80GB`, and `H20-3e` all tokenize cleanly.
     Hint ordering still matters: more specific hints must come first
-    (e.g. "A100 80GB" before plain "A100").
+    (e.g. "A100 80GB" before plain "A100", "H20-3E" before plain "H20").
     """
     # Normalize: uppercase, swap separators for spaces, collapse whitespace.
     haystack = " ".join(name.upper().replace("-", " ").split())
     for hint, price in GPU_PRICE_HINTS:
+        # Tokenize hint the same way as haystack so "H20-3E" → ["H20", "3E"].
         # Each token must appear as a whole word — `(?<![A-Z0-9])TOKEN(?![A-Z0-9])`
         # — so "A100" doesn't match "RTX A1000" and "L4" doesn't match "L40".
+        tokens = hint.upper().replace("-", " ").split()
         if all(re.search(rf"(?<![A-Z0-9]){re.escape(t)}(?![A-Z0-9])", haystack)
-               for t in hint.upper().split()):
+               for t in tokens):
             return price
     return None
 
