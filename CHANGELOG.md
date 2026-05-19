@@ -5,6 +5,29 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] — 2026-05-19
+
+### Added
+- **`Req/s` and `Req%` columns** in the table view, between Wait and Swap. Shows each replica's request rate and its share of the deployment's total — load-balancer skew is now visible at a glance ("e2 is taking 60% of req/s when there are 4 replicas").
+- **▸ Load balance section** — distinct from Imbalance check. Three checks, grouped by model:
+  - **request share** — windowed `req/s` distribution; flagged when one replica's long-window share is >1.5× median for ≥10s ("sticky-looking skew"). Single-poll skew is reported but not alerted (avoids one-blip false positives).
+  - **running req** — moved from Imbalance check; same median-based outlier detection.
+  - **token share** — combined in+out tokens/s distribution; same median-based check.
+- **Sticky skew detection** uses the snapshot-history rolling buffer to compute the request-share distribution over the last ~60s. Only fires when both the long-window share is skewed and the window covers ≥10s of data, so brief bursts don't trigger.
+
+### Changed
+- **Imbalance check now focuses on performance asymmetry only** (KV cache, slow-replica TTFT, slow-decode TPOT). The Running req check moved to the new Load balance section, since "is one replica getting more requests" is a load-distribution question, not a performance question.
+
+## [0.3.1] — 2026-05-19
+
+### Fixed
+- **`process_start_time_seconds` no longer filtered out under internal DP**. The gauge and histogram branches of `parse_snapshot()` were using the raw `keep()` predicate instead of `keep_for(name, labels)`, so process-wide Prometheus metrics (which carry no `engine` label) were being dropped whenever an engine filter was active. This made `vllm_uptime_seconds()` see a value of 0 and report nonsensical lifetime compute cost (~$13M / 56 years). All three sample categories (counter / gauge / histogram) now use the name-aware keep.
+- **Cost section no longer hidden along with Cumulative** when the terminal is short. Cost was previously nested inside the Cumulative `if` block; it's been hoisted out so it always renders when pricing is configured, regardless of whether Cumulative fits.
+
+### Added
+- **Terminal-height aware Cumulative section**. When the rendered output would exceed the terminal's `LINES`, the Cumulative table is auto-hidden with a one-line hint pointing to `--output json` for full data. Keeps the more important sections (table, imbalance, cost) visible on short terminals.
+- **Missing-pricing hint** in the Cost section: when only one of `--cost-in/--cost-out` or `--gpu-cost-hour` is set, a dim line tells you what flag to add to also see the other pricing model and the Margin row.
+
 ## [0.3.0] — 2026-05-19
 
 ### Added

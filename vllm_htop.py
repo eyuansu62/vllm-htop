@@ -40,6 +40,7 @@ import argparse
 import atexit
 import json
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -50,7 +51,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "0.3.0"
+__version__ = "0.3.2"
 
 
 # ───────────────────────────── ANSI styling ──────────────────────────────
@@ -210,17 +211,17 @@ def parse_snapshot(raw: str, engine_filter: Optional[str] = None) -> Snapshot:
         elif kind == "gauge":
             total = 0.0
             for labels, v in samples.get(name, []):
-                if keep(labels):
+                if keep_for(name, labels):
                     total += v
             snap.gauges[name] = total
         elif kind == "histogram":
             buckets: Dict[str, float] = {}
             for labels, v in samples.get(name + "_bucket", []):
-                if keep(labels):
+                if keep_for(name, labels):
                     le = labels.get("le", "+Inf")
                     buckets[le] = buckets.get(le, 0.0) + v
-            count = sum(v for labels, v in samples.get(name + "_count", []) if keep(labels))
-            sm    = sum(v for labels, v in samples.get(name + "_sum",   []) if keep(labels))
+            count = sum(v for labels, v in samples.get(name + "_count", []) if keep_for(name, labels))
+            sm    = sum(v for labels, v in samples.get(name + "_sum",   []) if keep_for(name, labels))
             snap.histograms[name] = {"buckets": buckets, "count": count, "sum": sm}
     return snap
 
@@ -1194,32 +1195,49 @@ def _median(values: List[float]) -> float:
     return s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2])
 
 
+def long_window_counter_delta(inst: Instance, fragment: str,
+                              target_secs: float) -> Optional[Tuple[float, float]]:
+    """Counter delta over the last `target_secs` for a metric on `inst`.
+
+    Returns (delta, elapsed_seconds) or None when we lack history. Uses the
+    same snapshot-history walk as `long_window_percentile` so a 60-second
+    request-share view stays consistent with the 60-second latency P95.
+    """
+    s = inst.snapshot
+    if s is None or not inst.snapshot_history:
+        return None
+    target_ts = s.timestamp - target_secs
+    base: Optional[Snapshot] = None
+    for h in inst.snapshot_history:
+        if h is s:
+            break
+        if h.timestamp <= target_ts:
+            base = h
+    if base is None:
+        base = inst.snapshot_history[0]
+    if base is s:
+        return None
+    name = find_metric(s.counters, fragment)
+    if not name:
+        return None
+    base_v = base.counters.get(name)
+    if base_v is None:
+        return None
+    return max(0.0, s.counters[name] - base_v), max(0.0, s.timestamp - base.timestamp)
+
+
 def _imbalance_check_for_group(
     group: List[Tuple[Instance, Dict[str, Any]]],
 ) -> Tuple[List[Tuple[str, str, bool]], int]:
-    """Run the 4 imbalance checks over a group of replicas (already filtered
-    to one model, all with valid summaries).
+    """Run the imbalance checks over a group of replicas (already filtered
+    to one model, all with valid summaries). This block now focuses on
+    *performance* asymmetry (slow GPU, KV pressure); request-distribution
+    asymmetry is in `_load_balance_check_for_group` and rendered separately.
 
     Returns (results, n_checks) where each result is (label, detail, is_bad).
-    Median-based outlier detection: ratio = max / median. Robust to idle
-    replicas (which would otherwise drag min to 0 and inflate max/min).
+    Median-based outlier detection: ratio = max / median.
     """
     results: List[Tuple[str, str, bool]] = []
-
-    # Running req — flag a single dominant replica
-    runs = [(i, s["running"]) for i, s in group if s["running"] is not None]
-    if len(runs) >= 2:
-        rs = [r[1] for r in runs]
-        r_min, r_max = min(rs), max(rs)
-        r_med = _median(rs)
-        outlier = max(runs, key=lambda x: x[1])[0]
-        bad = (r_max - r_min) > 3 and r_max > 1.5 * max(1.0, r_med)
-        if bad:
-            detail = (f"{BOLD}{outlier.name}{RESET}: {r_max:.0f} running "
-                      f"(median {r_med:.0f}, others as low as {r_min:.0f})")
-        else:
-            detail = f"range {r_min:.0f}–{r_max:.0f}, median {r_med:.0f}"
-        results.append(("Running req", detail, bad))
 
     # KV cache — Δ in percentage points, threshold 15pp
     kvs = [(i, s["kv_pct"]) for i, s in group if s["kv_pct"] is not None]
@@ -1315,6 +1333,166 @@ def _render_imbalance_sections(
     return blocks
 
 
+# How long a skew has to persist before we call it "sticky" rather than noise.
+LB_STICKY_WINDOW_SECS = 60.0
+# Minimum total req/s in the window before we trust the share computation
+# at all (very low traffic = high variance = false positives).
+LB_MIN_TOTAL_REQS = 5.0
+
+
+def _load_balance_check_for_group(
+    group: List[Tuple[Instance, Dict[str, Any]]],
+) -> List[Tuple[str, str, bool]]:
+    """Three checks for request-distribution asymmetry within one model group.
+
+    Each returns (label, detail, is_bad). Median-based ratios so an idle
+    replica can't fake an alert. Two flavors of "bad" are reported:
+      * **instant skew** — current poll's share max/median > 1.5
+      * **sticky skew**  — same condition holds in the long-window cumulative
+        delta (default ~60s). Sticky is the alert that actually matters for
+        production load balancers; instant alone is too noisy.
+    """
+    results: List[Tuple[str, str, bool]] = []
+
+    # --- Request share (instant + sticky) ---
+    rps_list = [(i, s["req_rps"]) for i, s in group if s["req_rps"] is not None]
+    total_rps = sum(r for _, r in rps_list)
+    if len(rps_list) >= 2 and total_rps >= 0.5:
+        shares = [(inst, r / total_rps * 100) for inst, r in rps_list]
+        share_vals = [s for _, s in shares]
+        med = _median(share_vals)
+        max_share = max(share_vals)
+        outlier = max(shares, key=lambda x: x[1])[0]
+        instant_bad = max_share > 1.5 * med and max_share > 1.5 * (100.0 / len(rps_list))
+
+        # Sticky check: look at the cumulative request_success delta over the
+        # long window (~60s) and recompute share. If the skew is still there,
+        # it's not just one bursty poll.
+        sticky_bad = False
+        sticky_detail = ""
+        deltas = []
+        elapsed_min = None
+        for inst, _ in rps_list:
+            d = long_window_counter_delta(inst, "request_success",
+                                          LB_STICKY_WINDOW_SECS)
+            if d is None:
+                deltas.append((inst, None))
+                continue
+            d_val, d_elapsed = d
+            deltas.append((inst, d_val))
+            elapsed_min = d_elapsed if elapsed_min is None else min(elapsed_min, d_elapsed)
+        long_total = sum(d for _, d in deltas if d is not None)
+        if long_total >= LB_MIN_TOTAL_REQS and elapsed_min and elapsed_min >= 10:
+            long_shares = [(i, (d / long_total * 100) if d is not None else 0.0)
+                           for i, d in deltas]
+            lmed = _median([s for _, s in long_shares])
+            lmax = max(s for _, s in long_shares)
+            sticky_outlier = max(long_shares, key=lambda x: x[1])[0]
+            if lmax > 1.5 * lmed and lmax > 1.5 * (100.0 / len(long_shares)):
+                sticky_bad = True
+                sticky_detail = (f"{BOLD}{sticky_outlier.name}{RESET} handled "
+                                 f"{lmax:.0f}% of requests for {int(elapsed_min)}s "
+                                 f"(median {lmed:.0f}%)")
+
+        bad = sticky_bad
+        if sticky_bad:
+            detail = sticky_detail
+            label = "sticky-looking skew"
+        elif instant_bad:
+            detail = (f"{BOLD}{outlier.name}{RESET}: {max_share:.0f}% of req/s right now "
+                      f"(median {med:.0f}%) — may be a one-poll blip")
+            label = "instant skew"
+            # Don't flag instant-only as bad; just informational
+            bad = False
+        else:
+            shares_fmt = ", ".join(f"{s:.0f}%" for s in sorted(share_vals, reverse=True))
+            detail = f"shares {shares_fmt}, median {med:.0f}%"
+            label = "request share"
+        results.append((label, detail, bad))
+
+    # --- Running req (instantaneous; complements request share) ---
+    runs = [(i, s["running"]) for i, s in group if s["running"] is not None]
+    if len(runs) >= 2:
+        rs = [r for _, r in runs]
+        r_min, r_max, r_med = min(rs), max(rs), _median(rs)
+        outlier = max(runs, key=lambda x: x[1])[0]
+        bad = (r_max - r_min) > 3 and r_max > 1.5 * max(1.0, r_med)
+        if bad:
+            detail = (f"{BOLD}{outlier.name}{RESET}: {r_max:.0f} running "
+                      f"(median {r_med:.0f}, others as low as {r_min:.0f})")
+        else:
+            detail = f"range {r_min:.0f}–{r_max:.0f}, median {r_med:.0f}"
+        results.append(("running req", detail, bad))
+
+    # --- Token share (in+out tok/s combined) ---
+    tok_list = []
+    for inst, s in group:
+        pr, gr = s["prompt_rps"], s["gen_rps"]
+        if pr is None and gr is None:
+            continue
+        tok_list.append((inst, (pr or 0) + (gr or 0)))
+    total_tok = sum(t for _, t in tok_list)
+    if len(tok_list) >= 2 and total_tok >= 1.0:
+        share_vals = [t / total_tok * 100 for _, t in tok_list]
+        med = _median(share_vals)
+        max_share = max(share_vals)
+        outlier = max(zip([i for i, _ in tok_list], share_vals), key=lambda x: x[1])[0]
+        bad = max_share > 1.5 * med and max_share > 1.5 * (100.0 / len(tok_list))
+        if bad:
+            detail = (f"{BOLD}{outlier.name}{RESET}: {max_share:.0f}% of tok/s "
+                      f"(median {med:.0f}%)")
+        else:
+            shares_fmt = ", ".join(f"{s:.0f}%" for s in sorted(share_vals, reverse=True))
+            detail = f"shares {shares_fmt}, median {med:.0f}%"
+        results.append(("token share", detail, bad))
+
+    return results
+
+
+def _render_load_balance_sections(
+    summaries: List[Tuple[Instance, Optional[Dict[str, Any]]]],
+) -> List[List[str]]:
+    """One ▸ Load balance block per model group (≥2 replicas).
+
+    Same collapse-when-healthy / expand-with-named-outlier shape as the
+    Imbalance check. Distinct section because the questions are different —
+    Imbalance answers "is one GPU slower?", Load balance answers "is one
+    GPU getting more than its share?"
+    """
+    by_model: Dict[Optional[str], List[Tuple[Instance, Dict[str, Any]]]] = {}
+    for inst, s in summaries:
+        if s is None:
+            continue
+        by_model.setdefault(inst.model, []).append((inst, s))
+
+    multi_model = len([k for k in by_model if k is not None]) > 1
+    blocks: List[List[str]] = []
+    for model, group in by_model.items():
+        if len(group) < 2:
+            continue
+        results = _load_balance_check_for_group(group)
+        if not results:
+            continue
+
+        n_checks = len(results)
+        n_bad = sum(1 for _, _, is_bad in results if is_bad)
+        suffix = f"  {DIM}(× {len(group)} replicas){RESET}"
+        if multi_model and model:
+            head = f"{BOLD}▸ Load balance  {short_model_name(model)}{RESET}{suffix}"
+        else:
+            head = f"{BOLD}▸ Load balance{RESET}{suffix}"
+
+        if n_bad == 0:
+            blocks.append([f"{head}  {GREEN}✓ {n_checks} checks pass{RESET}"])
+        else:
+            block = [f"{head}  {YELLOW}⚠ {n_bad}/{n_checks} failed{RESET}"]
+            for label, detail, bad in results:
+                icon = f"{RED}⚠{RESET}" if bad else f"{GREEN}✓{RESET}"
+                block.append(f"  {icon} {label:<20} {detail}")
+            blocks.append(block)
+    return blocks
+
+
 def render_table(instances: List[Instance], interval: float,
                  cost: Optional[CostConfig] = None) -> None:
     """Per-DP comparison table + aggregate row + imbalance check."""
@@ -1344,9 +1522,13 @@ def render_table(instances: List[Instance], interval: float,
     )
     cache_hdr = f"  Cache%" if show_cache else ""
     cache_pad = 8 if show_cache else 0
-    rule = GRAY + "─" * (86 + pad_extra + cache_pad) + RESET
+    # +13 for the two new columns (Req/s + Req%) inserted between Wait and Swap
+    rule = GRAY + "─" * (86 + 13 + pad_extra + cache_pad) + RESET
+    # Pre-compute totals for Req/s and Req% so each row knows its share.
+    total_req_rps = sum((s["req_rps"] or 0) for _, s in summaries if s is not None)
+
     lines[-1] = rule  # replace the rule we appended earlier
-    lines.append(f"{DIM} {'DP':<{name_w}}  Status   Run  Wait  Swap   KV%{cache_hdr}      in tok/s  out tok/s   TTFT-P95  TPOT-P95{RESET}")
+    lines.append(f"{DIM} {'DP':<{name_w}}  Status   Run  Wait  Req/s  Req%  Swap   KV%{cache_hdr}      in tok/s  out tok/s   TTFT-P95  TPOT-P95{RESET}")
     lines.append(rule)
 
     have_first_sample = False
@@ -1355,7 +1537,7 @@ def render_table(instances: List[Instance], interval: float,
             err = (inst.error or "no data yet")[:34]
             cache_dash = f"{GRAY}     —{RESET}" if show_cache else ""
             lines.append(f" {inst.name:<{name_w}} {RED}DOWN  {RESET} "
-                         f"{GRAY}  —     —     —      —{RESET}{cache_dash}"
+                         f"{GRAY}  —     —    —    —     —      —{RESET}{cache_dash}"
                          f"{GRAY}          —          —          —         —{RESET}  "
                          f"{DIM}{err}{RESET}")
             continue
@@ -1368,6 +1550,11 @@ def render_table(instances: List[Instance], interval: float,
         status = f"{YELLOW}STALE {RESET}" if inst.error else f"{GREEN}OK    {RESET}"
         ttft_ms = (smry["ttft_p95"] * 1000) if smry["ttft_p95"] is not None else None
         tpot_ms = (smry["tpot_p95"] * 1000) if smry["tpot_p95"] is not None else None
+
+        # Req% — share of the deployment's total request rate. Useful for
+        # spotting load-balancer skew at a glance.
+        rps = smry["req_rps"]
+        req_pct = (rps / total_req_rps * 100) if (rps and total_req_rps > 0) else None
 
         # Cache% cell (only when column is shown). Prefer window value;
         # fall back to lifetime if window hasn't accumulated samples yet.
@@ -1383,6 +1570,8 @@ def render_table(instances: List[Instance], interval: float,
             f" {inst.name:<{name_w}} {status} "
             f"{fmt(smry['running'], '{:.0f}'):>4}  "
             f"{wc}{fmt(smry['waiting'], '{:.0f}'):>4}{RESET}  "
+            f"{fmt(rps,     '{:.1f}'):>4}  "
+            f"{fmt(req_pct, '{:.0f}'):>3}%  "
             f"{sc}{fmt(smry['swapped'], '{:.0f}'):>4}{RESET}   "
             f"{kc}{fmt(smry['kv_pct'], '{:.1f}'):>5}%{RESET}"
             f"{cache_cell}    "
@@ -1432,10 +1621,13 @@ def render_table(instances: List[Instance], interval: float,
             cc = _cache_color(agg)
             agg_cache_cell = f"  {cc}{fmt(agg, '{:.0f}'):>4}%{RESET}"
 
+        sum_req_rps = sum((s["req_rps"] or 0) for s in ok_smries)
         lines.append(
             f" {BOLD}ALL{RESET}{' ' * (name_w - 3)}        "
             f" {sum_run:>4.0f}  "
             f"{sum_wait:>4.0f}  "
+            f"{sum_req_rps:>4.1f}  "
+            f"{DIM}100%{RESET}  "
             f"{sum_swap:>4.0f}    "
             f"{DIM}max{RESET}{fmt(max_kv, '{:.1f}'):>4}%"
             f"{agg_cache_cell}    "
@@ -1445,9 +1637,16 @@ def render_table(instances: List[Instance], interval: float,
             f"{fmt(tpot_ms_all, '{:.1f}'):>6}ms"
         )
 
-        # Imbalance check — grouped by model (so LLM and embedding aren't
-        # compared cross-workload) with median-based outlier detection so
-        # idle replicas don't blow up the ratio.
+        # Load balance — request-share / running / token-share asymmetry
+        # ("is one replica getting more than its fair share?"). Rendered first
+        # because it's the more actionable signal for production deployments;
+        # it points to the load balancer / sticky session / hash collision.
+        for group_lines in _render_load_balance_sections(summaries):
+            lines.append("")
+            lines.extend(group_lines)
+
+        # Imbalance check — performance asymmetry ("is one GPU slower than
+        # the others?"). KV pressure, slow TTFT/TPOT.
         for group_lines in _render_imbalance_sections(summaries):
             lines.append("")
             lines.extend(group_lines)
@@ -1456,122 +1655,151 @@ def render_table(instances: List[Instance], interval: float,
         lines.append("")
         lines.append(f"  {DIM}(throughput & percentiles populate after the 2nd poll…){RESET}")
 
-    # ── Cumulative section ──
-    if any(inst.first_seen is not None for inst in instances):
+    # ── Compute once for both Cost and Cumulative ──
+    first_seens = [inst.first_seen for inst in instances if inst.first_seen is not None]
+    have_data = bool(first_seens)
+    uptime = (time.time() - min(first_seens)) if first_seens else 0.0
+
+    sum_pin_life = sum_pout_life = sum_req_life = 0.0
+    for inst in instances:
+        if inst.snapshot is None:
+            continue
+        sc = inst.snapshot.counters
+        def _ctr(frag: str) -> Optional[float]:
+            n = find_metric(sc, frag)
+            return sc[n] if n else None
+        pin = _ctr("prompt_tokens")
+        pout = _ctr("generation_tokens")
+        req = _ctr("request_success")
+        if pin is not None:  sum_pin_life  += pin
+        if pout is not None: sum_pout_life += pout
+        if req is not None:  sum_req_life  += req
+
+    # ── Cost section ── (always shown when enabled; doesn't depend on
+    # Cumulative being rendered, so a short terminal won't hide it)
+    if have_data and cost is not None and cost.enabled:
+        ok_smries = [s for s in (summarize(i) for i in instances) if s is not None]
+
+        def _counter(snap: Snapshot, frag: str) -> float:
+            nm = find_metric(snap.counters, frag)
+            return snap.counters[nm] if nm else 0.0
+
         lines.append("")
-        # Use earliest first_seen as monitor uptime
-        first_seens = [inst.first_seen for inst in instances if inst.first_seen is not None]
-        uptime = (time.time() - min(first_seens)) if first_seens else 0.0
-        lines.append(f"{BOLD}▸ Cumulative{RESET}  "
-                     f"{DIM}(life = vLLM counters · sess = peaks observed since monitor uptime {fmt_duration(uptime)}){RESET}")
-        lines.append(rule)
-        lines.append(f"{DIM} {'DP':<{name_w}}   life-Prompt  life-Output  life-Reqs   peak-Run  peak-Wait  peak-KV%   peak in/out tok/s{RESET}")
-        lines.append(rule)
+        lines.append(f"{BOLD}▸ Cost{RESET}  "
+                     f"{DIM}(estimated · sum across {len(instances)} replicas){RESET}")
 
-        sum_pin_life = sum_pout_life = sum_req_life = 0.0
-        for inst in instances:
-            s = inst.snapshot
-            if s is None:
-                lines.append(f" {inst.name:<{name_w}} {GRAY}     —            —            —          —          —         —          — / —{RESET}")
-                continue
-            def ctr(frag: str) -> Optional[float]:
-                n = find_metric(s.counters, frag)
-                return s.counters[n] if n else None
-            pin  = ctr("prompt_tokens")
-            pout = ctr("generation_tokens")
-            req  = ctr("request_success")
-            if pin  is not None: sum_pin_life  += pin
-            if pout is not None: sum_pout_life += pout
-            if req  is not None: sum_req_life  += req
+        # Token-based
+        if cost.token_enabled:
+            life_total, life_in, life_out = cost.for_tokens(sum_pin_life, sum_pout_life)
+            sess_p = sess_g = 0.0
+            for i in instances:
+                if i.snapshot is None:
+                    continue
+                cur_p = _counter(i.snapshot, "prompt_tokens")
+                cur_g = _counter(i.snapshot, "generation_tokens")
+                sess_p += max(0.0, cur_p - (i.baseline_prompt_tokens or cur_p))
+                sess_g += max(0.0, cur_g - (i.baseline_gen_tokens    or cur_g))
+            sess_total, _, _ = cost.for_tokens(sess_p, sess_g)
+            sum_pin_rate  = sum((s["prompt_rps"] or 0) for s in ok_smries)
+            sum_pout_rate = sum((s["gen_rps"]    or 0) for s in ok_smries)
+            per_sec, _, _ = cost.for_tokens(sum_pin_rate, sum_pout_rate)
 
-            swap_warn = RED if inst.peak_swapped > 0 else ""
-            kv_warn   = RED if inst.peak_kv > 90 else YELLOW if inst.peak_kv > 75 else ""
-            lines.append(
-                f" {inst.name:<{name_w}}  "
-                f"{humanize(pin):>10}  "
-                f"{humanize(pout):>10}  "
-                f"{humanize(req):>9}    "
-                f"{inst.peak_running:>6.0f}     "
-                f"{inst.peak_waiting:>4.0f}    "
-                f"{kv_warn}{inst.peak_kv:>5.1f}%{RESET}   "
-                f"{humanize(inst.peak_prompt_rps):>5}/{humanize(inst.peak_gen_rps):<5}"
-                + (f"  {swap_warn}swap-seen{RESET}" if inst.peak_swapped > 0 else "")
-            )
-        lines.append(rule)
-        lines.append(
-            f" {BOLD}ALL{RESET}{' ' * (name_w - 3)}  "
-            f"{BOLD}{humanize(sum_pin_life):>10}{RESET}  "
-            f"{BOLD}{humanize(sum_pout_life):>10}{RESET}  "
-            f"{BOLD}{humanize(sum_req_life):>9}{RESET}"
-        )
+            lines.append(f"  {DIM}Token-based  ({cost.currency}{cost.input_per_m:g}/M in, "
+                         f"{cost.currency}{cost.output_per_m:g}/M out){RESET}")
+            lines.append(f"    Lifetime     : {BOLD}{fmt_money(life_total, cost.currency):>12}{RESET}  "
+                         f"{DIM}({fmt_money(life_in, cost.currency)} in + "
+                         f"{fmt_money(life_out, cost.currency)} out){RESET}")
+            lines.append(f"    This session : {BOLD}{fmt_money(sess_total, cost.currency):>12}{RESET}  "
+                         f"{DIM}(over {fmt_duration(uptime)}){RESET}")
+            if per_sec > 0:
+                lines.append(f"    Current rate : {BOLD}{fmt_money(per_sec*60, cost.currency):>12}/min{RESET}  "
+                             f"{DIM}({fmt_money(per_sec*3600, cost.currency)}/hour at current throughput){RESET}")
 
-        # ── Cost (when any pricing model is enabled) ──
-        if cost is not None and cost.enabled:
-            def _counter(snap: Snapshot, frag: str) -> float:
-                n = find_metric(snap.counters, frag)
-                return snap.counters[n] if n else 0.0
+        # Compute-based
+        if cost.compute_enabled:
+            src = " — auto-detected, estimate" if cost.gpu_price_source == "auto" else ""
+            model = cost.gpu_model or "GPU"
+            lines.append(f"  {DIM}Compute-based  ({model} × {cost.num_gpus} @ "
+                         f"{cost.currency}{cost.gpu_cost_hour:g}/h{src}){RESET}")
+            lines.append(f"    Burn rate    : {BOLD}{fmt_money(cost.compute_per_hour, cost.currency):>12}/hour{RESET}  "
+                         f"{DIM}(paid whether busy or idle){RESET}")
+            vllm_up = vllm_uptime_seconds(instances)
+            if vllm_up is not None and vllm_up > 0:
+                lines.append(f"    Lifetime     : {BOLD}{fmt_money(cost.for_seconds(vllm_up), cost.currency):>12}{RESET}  "
+                             f"{DIM}(over {fmt_duration(vllm_up)} of vLLM uptime){RESET}")
+            lines.append(f"    This session : {BOLD}{fmt_money(cost.for_seconds(uptime), cost.currency):>12}{RESET}  "
+                         f"{DIM}(over {fmt_duration(uptime)}){RESET}")
 
-            ok_smries = [s for s in (summarize(i) for i in instances) if s is not None]
+        # Margin (only meaningful when both pricings are on)
+        if cost.token_enabled and cost.compute_enabled and ok_smries:
+            sum_pin_rate  = sum((s["prompt_rps"] or 0) for s in ok_smries)
+            sum_pout_rate = sum((s["gen_rps"]    or 0) for s in ok_smries)
+            revenue_per_sec, _, _ = cost.for_tokens(sum_pin_rate, sum_pout_rate)
+            cost_per_sec = cost.compute_per_hour / 3600.0
+            if cost_per_sec > 0:
+                ratio = revenue_per_sec / cost_per_sec
+                color = GREEN if ratio >= 2.0 else YELLOW if ratio >= 1.0 else RED
+                lines.append(f"  {DIM}Margin (token revenue ÷ compute cost){RESET}")
+                lines.append(f"    At current load : {color}{BOLD}{ratio:>9.2f}×{RESET}  "
+                             f"{DIM}({fmt_money(revenue_per_sec*3600, cost.currency)}/h revenue vs "
+                             f"{fmt_money(cost.compute_per_hour, cost.currency)}/h compute){RESET}")
 
+        # Hint when only one pricing model is on — explains the "missing"
+        # subsection the user might expect.
+        if cost.compute_enabled and not cost.token_enabled:
+            lines.append(f"  {DIM}✦ pass --cost-in PRICE --cost-out PRICE to also see token cost and Margin{RESET}")
+        elif cost.token_enabled and not cost.compute_enabled:
+            lines.append(f"  {DIM}✦ pass --gpu-cost-hour PRICE to also see compute cost and Margin{RESET}")
+
+    # ── Cumulative section ── (auto-hidden when terminal is too short)
+    if have_data:
+        try:
+            term_h = shutil.get_terminal_size((100, 24)).lines
+        except (AttributeError, OSError):
+            term_h = 24
+        # Approx height of Cumulative + Legend so we can decide ahead of time.
+        cumulative_h = 5 + len(instances) + 1   # header + rule + rule + rows + rule + ALL
+        legend_h = 3                            # blank + Legend + Ctrl-C
+        projected = len(lines) + cumulative_h + legend_h
+
+        if projected <= term_h:
             lines.append("")
-            lines.append(f"{BOLD}▸ Cost{RESET}  "
-                         f"{DIM}(estimated · sum across {len(instances)} replicas){RESET}")
-
-            # Token-based
-            if cost.token_enabled:
-                life_total, life_in, life_out = cost.for_tokens(sum_pin_life, sum_pout_life)
-                sess_p = sess_g = 0.0
-                for i in instances:
-                    if i.snapshot is None:
-                        continue
-                    cur_p = _counter(i.snapshot, "prompt_tokens")
-                    cur_g = _counter(i.snapshot, "generation_tokens")
-                    sess_p += max(0.0, cur_p - (i.baseline_prompt_tokens or cur_p))
-                    sess_g += max(0.0, cur_g - (i.baseline_gen_tokens    or cur_g))
-                sess_total, _, _ = cost.for_tokens(sess_p, sess_g)
-                sum_pin_rate  = sum((s["prompt_rps"] or 0) for s in ok_smries)
-                sum_pout_rate = sum((s["gen_rps"]    or 0) for s in ok_smries)
-                per_sec, _, _ = cost.for_tokens(sum_pin_rate, sum_pout_rate)
-
-                lines.append(f"  {DIM}Token-based  ({cost.currency}{cost.input_per_m:g}/M in, "
-                             f"{cost.currency}{cost.output_per_m:g}/M out){RESET}")
-                lines.append(f"    Lifetime     : {BOLD}{fmt_money(life_total, cost.currency):>12}{RESET}  "
-                             f"{DIM}({fmt_money(life_in, cost.currency)} in + "
-                             f"{fmt_money(life_out, cost.currency)} out){RESET}")
-                lines.append(f"    This session : {BOLD}{fmt_money(sess_total, cost.currency):>12}{RESET}  "
-                             f"{DIM}(over {fmt_duration(uptime)}){RESET}")
-                if per_sec > 0:
-                    lines.append(f"    Current rate : {BOLD}{fmt_money(per_sec*60, cost.currency):>12}/min{RESET}  "
-                                 f"{DIM}({fmt_money(per_sec*3600, cost.currency)}/hour at current throughput){RESET}")
-
-            # Compute-based
-            if cost.compute_enabled:
-                src = " — auto-detected, estimate" if cost.gpu_price_source == "auto" else ""
-                model = cost.gpu_model or "GPU"
-                lines.append(f"  {DIM}Compute-based  ({model} × {cost.num_gpus} @ "
-                             f"{cost.currency}{cost.gpu_cost_hour:g}/h{src}){RESET}")
-                lines.append(f"    Burn rate    : {BOLD}{fmt_money(cost.compute_per_hour, cost.currency):>12}/hour{RESET}  "
-                             f"{DIM}(paid whether busy or idle){RESET}")
-                vllm_up = vllm_uptime_seconds(instances)
-                if vllm_up is not None and vllm_up > 0:
-                    lines.append(f"    Lifetime     : {BOLD}{fmt_money(cost.for_seconds(vllm_up), cost.currency):>12}{RESET}  "
-                                 f"{DIM}(over {fmt_duration(vllm_up)} of vLLM uptime){RESET}")
-                lines.append(f"    This session : {BOLD}{fmt_money(cost.for_seconds(uptime), cost.currency):>12}{RESET}  "
-                             f"{DIM}(over {fmt_duration(uptime)}){RESET}")
-
-            # Margin: token revenue vs compute cost
-            if cost.token_enabled and cost.compute_enabled and ok_smries:
-                sum_pin_rate  = sum((s["prompt_rps"] or 0) for s in ok_smries)
-                sum_pout_rate = sum((s["gen_rps"]    or 0) for s in ok_smries)
-                revenue_per_sec, _, _ = cost.for_tokens(sum_pin_rate, sum_pout_rate)
-                cost_per_sec = cost.compute_per_hour / 3600.0
-                if cost_per_sec > 0:
-                    ratio = revenue_per_sec / cost_per_sec
-                    color = GREEN if ratio >= 2.0 else YELLOW if ratio >= 1.0 else RED
-                    lines.append(f"  {DIM}Margin (token revenue ÷ compute cost){RESET}")
-                    lines.append(f"    At current load : {color}{BOLD}{ratio:>9.2f}×{RESET}  "
-                                 f"{DIM}({fmt_money(revenue_per_sec*3600, cost.currency)}/h revenue vs "
-                                 f"{fmt_money(cost.compute_per_hour, cost.currency)}/h compute){RESET}")
+            lines.append(f"{BOLD}▸ Cumulative{RESET}  "
+                         f"{DIM}(life = vLLM counters · sess = peaks observed since monitor uptime {fmt_duration(uptime)}){RESET}")
+            lines.append(rule)
+            lines.append(f"{DIM} {'DP':<{name_w}}   life-Prompt  life-Output  life-Reqs   peak-Run  peak-Wait  peak-KV%   peak in/out tok/s{RESET}")
+            lines.append(rule)
+            for inst in instances:
+                s = inst.snapshot
+                if s is None:
+                    lines.append(f" {inst.name:<{name_w}} {GRAY}     —            —            —          —          —         —          — / —{RESET}")
+                    continue
+                def _c(frag: str) -> Optional[float]:
+                    nm = find_metric(s.counters, frag)
+                    return s.counters[nm] if nm else None
+                pin, pout, req = _c("prompt_tokens"), _c("generation_tokens"), _c("request_success")
+                swap_warn = RED if inst.peak_swapped > 0 else ""
+                kv_warn   = RED if inst.peak_kv > 90 else YELLOW if inst.peak_kv > 75 else ""
+                lines.append(
+                    f" {inst.name:<{name_w}}  "
+                    f"{humanize(pin):>10}  {humanize(pout):>10}  {humanize(req):>9}    "
+                    f"{inst.peak_running:>6.0f}     {inst.peak_waiting:>4.0f}    "
+                    f"{kv_warn}{inst.peak_kv:>5.1f}%{RESET}   "
+                    f"{humanize(inst.peak_prompt_rps):>5}/{humanize(inst.peak_gen_rps):<5}"
+                    + (f"  {swap_warn}swap-seen{RESET}" if inst.peak_swapped > 0 else "")
+                )
+            lines.append(rule)
+            lines.append(
+                f" {BOLD}ALL{RESET}{' ' * (name_w - 3)}  "
+                f"{BOLD}{humanize(sum_pin_life):>10}{RESET}  "
+                f"{BOLD}{humanize(sum_pout_life):>10}{RESET}  "
+                f"{BOLD}{humanize(sum_req_life):>9}{RESET}"
+            )
+        else:
+            lines.append("")
+            shortfall = projected - term_h
+            lines.append(f"{DIM}(▸ Cumulative hidden — needs {shortfall} more terminal rows; "
+                         f"resize, or run `vllm-htop --output json` for full data){RESET}")
 
     lines.append("")
     # Legend: one entry per URL. When the model is known, show it as the
