@@ -5,9 +5,15 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.0] — 2026-05-18
+## [0.2.1] — 2026-05-18
+
+> Skipped 0.2.0 on PyPI — everything from that working-version batch ships here.
+
+
 
 ### Added
+- **vLLM internal DP is now auto-split** in both detail and table views. When a single `/metrics` endpoint exposes multiple `engine="N"` labels (typical of `vllm serve --data-parallel-size N`), `vllm-htop` detects them on first contact and expands the URL into one virtual replica per engine — so the table shows per-engine rows, the imbalance check runs across engines, and aggregate percentiles are correctly merged. External DP (multiple URLs) and internal DP (engine labels) can be combined; replicas are named `0`/`1` for pure external, `e0`/`e1` for pure internal, and `0.e0`/`1.e1` for mixed setups. No new flag — detection is automatic.
+- Table view auto-sizes the DP column width for longer engine-split names, and dedupes the URL legend when multiple engines share an endpoint.
 - **▸ Cost section** in both detail and table views, supporting two independent pricing models that can be enabled together:
   - **Token-based** (opt-in via `--cost-in $/M` + `--cost-out $/M`, USD per 1 million tokens, OpenAI-style convention). Shows lifetime cost (from `*_total` counters), this-session cost (counter delta since attach), and current rate (windowed throughput × price) in $/min and $/hour.
   - **Compute-based** (auto-detected via `nvidia-smi --query-gpu=name`, with a built-in GPU price-hint table). Coverage: Blackwell (B200/B100/GB200, RTX PRO 6000, RTX 5090/5080), Hopper (H100/H100 NVL/H200), Ampere (A100 40/80GB, A40/A30/A10/A10G, RTX A6000/A5000/A4000, RTX 3090), Ada Lovelace (L40S/L40/L4, RTX 6000 Ada, RTX 4090/4080), and older datacenter chips (V100/T4). Prices anchored to **RunPod Secure tier** published rates as of 2026-05, which represents what OpenRouter-class token-API providers typically pay for compute. Cross-provider variance ≈ ±30% (AWS on-demand 3-5× higher; vast.ai community 20-40% lower). Shows hourly burn rate (paid whether busy or idle) and this-session cost. Overridable with `--gpu-cost-hour` and `--num-gpus`; opt out via `--no-gpu-detect`. GPU-name matching uses word-boundary token matching to correctly disambiguate variants (e.g. `A100-SXM4-80GB` vs `A100-SXM4-40GB`, `L4` vs `L40` vs `L40S`).

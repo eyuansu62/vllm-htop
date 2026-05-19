@@ -233,9 +233,22 @@ Two clearly-labelled sources:
 - **Parallel polling** via `ThreadPoolExecutor` — refresh time stays ≈ slowest single fetch regardless of replica count.
 - Metric-name matching is **substring-based** (`time_to_first_token`, `cache_usage_perc`) so the tool tolerates vLLM version drift between `vllm:gpu_cache_usage_perc` and `vllm:kv_cache_usage_perc`.
 
+## Internal DP (engine labels) is auto-split
+
+When you run `vllm serve --data-parallel-size N`, vLLM exposes one `/metrics` endpoint whose samples are tagged with `engine="0".."N-1"`. `vllm-htop` detects this on first contact and **expands the single URL into one virtual replica per engine** — so the comparison table, imbalance check, and aggregate percentiles all work just like they do for separate-process external DP.
+
+Naming convention in the table:
+
+| Setup | Replica names |
+|---|---|
+| Pure external (N URLs, no engine label) | `0`, `1`, `2`, … |
+| Pure internal (1 URL, N engines) | `e0`, `e1`, `e2`, … |
+| Mixed (M URLs × N engines each) | `0.e0`, `0.e1`, `1.e0`, … |
+
+No new flag — detection runs automatically on startup.
+
 ## Limitations
 
-- **vLLM internal DP** (`vllm serve --data-parallel-size N` where multiple ranks share one `/metrics` endpoint and label samples with `engine="0"`, `engine="1"`, etc.): currently all engines' samples are summed into one. For per-rank visibility, run a separate `vllm-htop` per endpoint, or open an issue for `--split-by-label` support.
 - **Peaks are in-memory only** — when the script exits, session peaks are lost. For long-term persistence, use Prometheus.
 - **No alerting** — this is a viewer, not a notifier. For real alerting see [Andrey Krisanov's vLLM Prometheus rules](https://akrisanov.com/vllm-metrics/) as a starting point.
 

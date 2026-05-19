@@ -48,7 +48,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 
 # ───────────────────────────── ANSI styling ──────────────────────────────
@@ -127,32 +127,66 @@ class Snapshot:
     # histogram: name → {"buckets": {le: cum_count}, "count": x, "sum": x}
 
 
-def parse_snapshot(raw: str) -> Snapshot:
+def parse_snapshot(raw: str, engine_filter: Optional[str] = None) -> Snapshot:
+    """Parse raw /metrics text into a Snapshot.
+
+    When `engine_filter` is None (default), all samples are aggregated — the
+    legacy behavior, correct for endpoints that don't use vLLM's internal DP.
+
+    When `engine_filter` is set (e.g. "0"), only samples carrying
+    `engine="<value>"` are included. This is how we surface per-engine views
+    of a single `/metrics` endpoint produced by
+    `vllm serve --data-parallel-size N`.
+    """
     types, samples = parse_prom_text(raw)
     snap = Snapshot(timestamp=time.time())
+
+    def keep(labels: Dict[str, str]) -> bool:
+        return engine_filter is None or labels.get("engine") == engine_filter
+
     for name, kind in types.items():
         if not name.startswith("vllm"):
             continue
         if kind == "counter":
             total = 0.0
             for sample_name in (name, name + "_total"):
-                for _l, v in samples.get(sample_name, []):
-                    total += v
+                for labels, v in samples.get(sample_name, []):
+                    if keep(labels):
+                        total += v
             snap.counters[name] = total
         elif kind == "gauge":
             total = 0.0
-            for _l, v in samples.get(name, []):
-                total += v
+            for labels, v in samples.get(name, []):
+                if keep(labels):
+                    total += v
             snap.gauges[name] = total
         elif kind == "histogram":
             buckets: Dict[str, float] = {}
             for labels, v in samples.get(name + "_bucket", []):
-                le = labels.get("le", "+Inf")
-                buckets[le] = buckets.get(le, 0.0) + v
-            count = sum(v for _l, v in samples.get(name + "_count", []))
-            sm    = sum(v for _l, v in samples.get(name + "_sum",   []))
+                if keep(labels):
+                    le = labels.get("le", "+Inf")
+                    buckets[le] = buckets.get(le, 0.0) + v
+            count = sum(v for labels, v in samples.get(name + "_count", []) if keep(labels))
+            sm    = sum(v for labels, v in samples.get(name + "_sum",   []) if keep(labels))
             snap.histograms[name] = {"buckets": buckets, "count": count, "sum": sm}
     return snap
+
+
+def detect_engines(raw: str) -> List[str]:
+    """Return sorted distinct values of the `engine` label, or [] if absent.
+
+    vLLM's internal data-parallel mode labels samples with `engine="0".."N-1"`.
+    A non-empty return value means this endpoint hosts multiple engines in one
+    process; we use that to expand a single URL into multiple virtual Instances.
+    """
+    _types, samples = parse_prom_text(raw)
+    engines: set = set()
+    for sample_list in samples.values():
+        for labels, _ in sample_list:
+            eng = labels.get("engine")
+            if eng is not None:
+                engines.add(eng)
+    return sorted(engines, key=lambda e: int(e) if e.isdigit() else e)
 
 
 # ───────────────────────────── analytics ─────────────────────────────────
@@ -393,6 +427,9 @@ def fmt_money(v: Optional[float], symbol: str = "$") -> str:
 class Instance:
     name: str
     url: str
+    # When set, this Instance is one engine of a multi-engine /metrics endpoint
+    # (vLLM internal DP). Fetches go to `url`, parsing filters by this label.
+    engine: Optional[str] = None
     snapshot: Optional[Snapshot] = None
     prev: Optional[Snapshot] = None
     error: Optional[str] = None
@@ -493,11 +530,11 @@ def _update_history(inst: Instance) -> None:
         push(inst.hist_tpot_p95, smry["tpot_p95"] * 1000.0)
 
 
-def fetch_one(inst: Instance, timeout: float) -> None:
+def _apply_raw(inst: Instance, raw: str) -> None:
+    """Update an Instance from raw /metrics text (applying its engine filter)."""
     try:
-        raw = fetch_metrics(inst.url, timeout=timeout)
         inst.prev = inst.snapshot
-        inst.snapshot = parse_snapshot(raw)
+        inst.snapshot = parse_snapshot(raw, engine_filter=inst.engine)
         inst.error = None
         _update_session(inst)
         _update_history(inst)
@@ -506,11 +543,78 @@ def fetch_one(inst: Instance, timeout: float) -> None:
 
 
 def fetch_all(instances: List[Instance], timeout: float = 5.0) -> None:
-    """Parallel fetch — keeps total fetch time ≈ slowest single fetch."""
+    """Parallel fetch — keeps total fetch time ≈ slowest single fetch.
+
+    Multiple Instances may share a single URL (vLLM internal DP: one endpoint,
+    N engines → N virtual Instances). We fetch each URL exactly once and
+    demultiplex the response across its sub-instances via their engine filter.
+    """
     if not instances:
         return
+
+    # Group instances by URL so each URL is fetched once.
+    by_url: Dict[str, List[Instance]] = {}
+    for inst in instances:
+        by_url.setdefault(inst.url, []).append(inst)
+
+    def fetch_url(url: str) -> Tuple[str, Optional[str], Optional[Exception]]:
+        try:
+            return url, fetch_metrics(url, timeout=timeout), None
+        except Exception as e:
+            return url, None, e
+
+    with ThreadPoolExecutor(max_workers=min(32, len(by_url))) as ex:
+        results = list(ex.map(fetch_url, by_url.keys()))
+
+    for url, raw, err in results:
+        for inst in by_url[url]:
+            if err is not None:
+                inst.error = f"{type(err).__name__}: {err}"
+            else:
+                _apply_raw(inst, raw)
+
+
+def expand_instances_by_engine(instances: List[Instance],
+                               timeout: float = 5.0) -> List[Instance]:
+    """Probe each URL once; for endpoints that expose multiple `engine` labels,
+    expand the single Instance into one Instance per engine.
+
+    Called once at startup. The returned list is what the monitor loop polls.
+    If a URL is unreachable on this initial probe we keep the original Instance
+    — it'll just render as DOWN until the network recovers.
+    """
+    def probe(inst: Instance) -> Tuple[Instance, Optional[str]]:
+        try:
+            return inst, fetch_metrics(inst.url, timeout=timeout)
+        except Exception:
+            return inst, None
+
     with ThreadPoolExecutor(max_workers=min(32, len(instances))) as ex:
-        list(ex.map(lambda i: fetch_one(i, timeout), instances))
+        probed = list(ex.map(probe, instances))
+
+    multi_url = len(instances) > 1
+    expanded: List[Instance] = []
+    for inst, raw in probed:
+        if raw is None:
+            # Probe failed — keep the Instance as-is; the next fetch attempt
+            # will surface the real fetch error.
+            expanded.append(inst)
+            continue
+        engines = detect_engines(raw)
+        if len(engines) <= 1:
+            expanded.append(inst)
+        else:
+            # Multi-engine — fan out into per-engine sub-instances. Naming:
+            #   * external-only:   "0", "1", ...           (unchanged)
+            #   * internal-only:   "e0", "e1", ...
+            #   * mixed (N×M):     "0.e0", "0.e1", "1.e0", ...
+            for eng in engines:
+                sub_name = (f"{inst.name}.e{eng}" if multi_url else f"e{eng}")
+                expanded.append(Instance(name=sub_name, url=inst.url, engine=eng))
+    # Note: we deliberately don't seed any snapshots here — the monitor loop's
+    # first fetch_all() does that. Seeding would set prev to a snapshot taken
+    # microseconds earlier, giving meaningless rates on the first render.
+    return expanded
 
 
 def summarize(inst: Instance) -> Optional[Dict[str, Any]]:
@@ -841,20 +945,27 @@ def render_table(instances: List[Instance], interval: float,
     n = len(instances)
     up = sum(1 for inst, smry in summaries if smry is not None and not inst.error)
 
+    # Dynamic width for the DP/engine name column — short ("0","1") for plain
+    # external DP, longer ("0.e0","1.e15") when internal DP is also in play.
+    name_w = max(2, max((len(i.name) for i in instances), default=2))
+    # Pad the header label so the column lines still align at width 86.
+    pad_extra = max(0, name_w - 3)
+    rule = GRAY + "─" * (86 + pad_extra) + RESET
+
     lines: List[str] = [CLEAR]
     ts = datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d %H:%M:%S")
     health = f"{GREEN}{up}/{n} up{RESET}" if up == n else f"{RED}{up}/{n} up{RESET}"
     lines.append(f"{BOLD}{CYAN}vLLM DP Monitor{RESET}  {DIM}│{RESET}  "
                  f"{health}  {DIM}│{RESET}  {ts}  {DIM}(interval={interval}s){RESET}")
-    lines.append(GRAY + "─" * 86 + RESET)
-    lines.append(f"{DIM} DP  Status   Run  Wait  Swap   KV%      in tok/s  out tok/s   TTFT-P95  TPOT-P95{RESET}")
-    lines.append(GRAY + "─" * 86 + RESET)
+    lines.append(rule)
+    lines.append(f"{DIM} {'DP':<{name_w}}  Status   Run  Wait  Swap   KV%      in tok/s  out tok/s   TTFT-P95  TPOT-P95{RESET}")
+    lines.append(rule)
 
     have_first_sample = False
     for inst, smry in summaries:
         if smry is None:
             err = (inst.error or "no data yet")[:34]
-            lines.append(f" {inst.name:<3} {RED}DOWN  {RESET} "
+            lines.append(f" {inst.name:<{name_w}} {RED}DOWN  {RESET} "
                          f"{GRAY}  —     —     —      —          —          —          —         —{RESET}  "
                          f"{DIM}{err}{RESET}")
             continue
@@ -869,7 +980,7 @@ def render_table(instances: List[Instance], interval: float,
         tpot_ms = (smry["tpot_p95"] * 1000) if smry["tpot_p95"] is not None else None
 
         lines.append(
-            f" {inst.name:<3} {status} "
+            f" {inst.name:<{name_w}} {status} "
             f"{fmt(smry['running'], '{:.0f}'):>4}  "
             f"{wc}{fmt(smry['waiting'], '{:.0f}'):>4}{RESET}  "
             f"{sc}{fmt(smry['swapped'], '{:.0f}'):>4}{RESET}   "
@@ -882,7 +993,7 @@ def render_table(instances: List[Instance], interval: float,
 
     ok_smries = [s for _, s in summaries if s is not None]
     if ok_smries:
-        lines.append(GRAY + "─" * 86 + RESET)
+        lines.append(rule)
         sum_run  = sum((s["running"] or 0) for s in ok_smries)
         sum_wait = sum((s["waiting"] or 0) for s in ok_smries)
         sum_swap = sum((s["swapped"] or 0) for s in ok_smries)
@@ -900,7 +1011,7 @@ def render_table(instances: List[Instance], interval: float,
         tpot_ms_all = (tpot_all * 1000) if tpot_all else None
 
         lines.append(
-            f" {BOLD}ALL{RESET}        "
+            f" {BOLD}ALL{RESET}{' ' * (name_w - 3)}        "
             f" {sum_run:>4.0f}  "
             f"{sum_wait:>4.0f}  "
             f"{sum_swap:>4.0f}    "
@@ -957,15 +1068,15 @@ def render_table(instances: List[Instance], interval: float,
         uptime = (time.time() - min(first_seens)) if first_seens else 0.0
         lines.append(f"{BOLD}▸ Cumulative{RESET}  "
                      f"{DIM}(life = vLLM counters · sess = peaks observed since monitor uptime {fmt_duration(uptime)}){RESET}")
-        lines.append(GRAY + "─" * 86 + RESET)
-        lines.append(f"{DIM} DP   life-Prompt  life-Output  life-Reqs   peak-Run  peak-Wait  peak-KV%   peak in/out tok/s{RESET}")
-        lines.append(GRAY + "─" * 86 + RESET)
+        lines.append(rule)
+        lines.append(f"{DIM} {'DP':<{name_w}}   life-Prompt  life-Output  life-Reqs   peak-Run  peak-Wait  peak-KV%   peak in/out tok/s{RESET}")
+        lines.append(rule)
 
         sum_pin_life = sum_pout_life = sum_req_life = 0.0
         for inst in instances:
             s = inst.snapshot
             if s is None:
-                lines.append(f" {inst.name:<3} {GRAY}     —            —            —          —          —         —          — / —{RESET}")
+                lines.append(f" {inst.name:<{name_w}} {GRAY}     —            —            —          —          —         —          — / —{RESET}")
                 continue
             def ctr(frag: str) -> Optional[float]:
                 n = find_metric(s.counters, frag)
@@ -980,7 +1091,7 @@ def render_table(instances: List[Instance], interval: float,
             swap_warn = RED if inst.peak_swapped > 0 else ""
             kv_warn   = RED if inst.peak_kv > 90 else YELLOW if inst.peak_kv > 75 else ""
             lines.append(
-                f" {inst.name:<3}  "
+                f" {inst.name:<{name_w}}  "
                 f"{humanize(pin):>10}  "
                 f"{humanize(pout):>10}  "
                 f"{humanize(req):>9}    "
@@ -990,9 +1101,9 @@ def render_table(instances: List[Instance], interval: float,
                 f"{humanize(inst.peak_prompt_rps):>5}/{humanize(inst.peak_gen_rps):<5}"
                 + (f"  {swap_warn}swap-seen{RESET}" if inst.peak_swapped > 0 else "")
             )
-        lines.append(GRAY + "─" * 86 + RESET)
+        lines.append(rule)
         lines.append(
-            f" {BOLD}ALL{RESET}  "
+            f" {BOLD}ALL{RESET}{' ' * (name_w - 3)}  "
             f"{BOLD}{humanize(sum_pin_life):>10}{RESET}  "
             f"{BOLD}{humanize(sum_pout_life):>10}{RESET}  "
             f"{BOLD}{humanize(sum_req_life):>9}{RESET}"
@@ -1063,7 +1174,16 @@ def render_table(instances: List[Instance], interval: float,
                                  f"{fmt_money(cost.compute_per_hour, cost.currency)}/h compute){RESET}")
 
     lines.append("")
-    legend = "  ".join(f"DP{i.name}={i.url.replace('/metrics','')}" for i in instances)
+    # Dedupe URLs (internal-DP engines all share one URL) and group their
+    # display names against it.
+    by_url_legend: Dict[str, List[str]] = {}
+    for i in instances:
+        by_url_legend.setdefault(i.url.replace("/metrics", ""), []).append(i.name)
+    legend = "  ".join(
+        f"DP{','.join(names)}={url}" if len(names) == 1
+        else f"DP{{{','.join(names)}}}={url}"
+        for url, names in by_url_legend.items()
+    )
     lines.append(GRAY + "Legend: " + legend + RESET)
     lines.append(GRAY + "Ctrl-C to exit" + RESET)
     sys.stdout.write("\n".join(lines) + "\n")
@@ -1276,6 +1396,15 @@ def main() -> None:
         Instance(name=str(i), url=u.rstrip("/") + "/metrics")
         for i, u in enumerate(urls)
     ]
+
+    # One-shot probe: expand single URLs that expose vLLM internal DP (multiple
+    # `engine="*"` labels in one /metrics) into per-engine sub-instances.
+    instances = expand_instances_by_engine(instances, timeout=args.timeout)
+    if any(inst.engine is not None for inst in instances):
+        n_engines = sum(1 for inst in instances if inst.engine is not None)
+        print(f"vllm-htop: detected internal DP — expanded to {len(instances)} "
+              f"replica(s) (of which {n_engines} are engine splits)",
+              file=sys.stderr, flush=True)
 
     use_table = args.table or (len(instances) >= 2 and not args.detail)
 
