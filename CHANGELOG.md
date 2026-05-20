@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.2] — 2026-05-19
 
+### Changed
+- **All-healthy multi-group checks collapse to one line per section.** When every model group passes every check, the Load balance and Imbalance check sections each collapse to `▸ <section>  ✓ all N model groups OK (× M replicas total)` instead of one line per group. Adjacent single-line summaries no longer get a blank separator. Together this saves ~5 vertical rows for a 2-model 8-engine setup — the difference between fitting the full output on a 13" MacBook terminal and having the Cumulative section get auto-hidden. When any check fails the relevant block expands automatically, so no diagnostic info is lost.
+
 ### Added
 - **`Req/s` and `Req%` columns** in the table view, between Wait and Swap. Shows each replica's request rate and its share of the deployment's total — load-balancer skew is now visible at a glance ("e2 is taking 60% of req/s when there are 4 replicas").
 - **▸ Load balance section** — distinct from Imbalance check. Three checks, grouped by model:

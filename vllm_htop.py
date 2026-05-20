@@ -1294,10 +1294,11 @@ def _render_imbalance_sections(
     """Yield one block of lines per model-group that has ≥2 ok replicas.
 
     Healthy groups collapse to a single line; groups with at least one
-    failed check expand to detail. Groups are labeled by short model name
-    when multiple models are present in the deployment.
+    failed check expand to detail. When EVERY group across the deployment
+    is healthy and there's more than one of them, the whole section
+    collapses further into a single "✓ N model groups OK" summary —
+    keeps short terminals readable.
     """
-    # Group by model (None / missing → "_unlabeled" bucket).
     by_model: Dict[Optional[str], List[Tuple[Instance, Dict[str, Any]]]] = {}
     for inst, s in summaries:
         if s is None:
@@ -1306,15 +1307,19 @@ def _render_imbalance_sections(
 
     multi_model = len([k for k in by_model if k is not None]) > 1
     blocks: List[List[str]] = []
+    all_healthy = True
+    total_replicas = 0
     for model, group in by_model.items():
         if len(group) < 2:
             continue
+        total_replicas += len(group)
         results, n_checks = _imbalance_check_for_group(group)
         if not results:
             continue
 
         n_bad = sum(1 for _, _, is_bad in results if is_bad)
-        # Header — show model label only when multiple models share the deployment.
+        if n_bad > 0:
+            all_healthy = False
         suffix = f"  {DIM}(× {len(group)} replicas){RESET}"
         if multi_model and model:
             head = f"{BOLD}▸ Imbalance check  {short_model_name(model)}{RESET}{suffix}"
@@ -1322,7 +1327,6 @@ def _render_imbalance_sections(
             head = f"{BOLD}▸ Imbalance check{RESET}{suffix}"
 
         if n_bad == 0:
-            # Healthy → collapse into one line, no detail
             blocks.append([f"{head}  {GREEN}✓ all {n_checks} checks pass{RESET}"])
         else:
             block = [f"{head}  {YELLOW}⚠ {n_bad}/{n_checks} failed{RESET}"]
@@ -1330,6 +1334,12 @@ def _render_imbalance_sections(
                 icon = f"{RED}⚠{RESET}" if bad else f"{GREEN}✓{RESET}"
                 block.append(f"  {icon} {label:<20} {detail}")
             blocks.append(block)
+
+    # All-healthy multi-group → one-liner summary
+    if all_healthy and len(blocks) > 1:
+        return [[f"{BOLD}▸ Imbalance check{RESET}  "
+                 f"{GREEN}✓ all {len(blocks)} model groups OK{RESET}  "
+                 f"{DIM}(× {total_replicas} replicas total){RESET}"]]
     return blocks
 
 
@@ -1454,10 +1464,8 @@ def _render_load_balance_sections(
 ) -> List[List[str]]:
     """One ▸ Load balance block per model group (≥2 replicas).
 
-    Same collapse-when-healthy / expand-with-named-outlier shape as the
-    Imbalance check. Distinct section because the questions are different —
-    Imbalance answers "is one GPU slower?", Load balance answers "is one
-    GPU getting more than its share?"
+    Same compaction rules as Imbalance check: healthy groups → one line,
+    all-healthy multi-group → single section summary.
     """
     by_model: Dict[Optional[str], List[Tuple[Instance, Dict[str, Any]]]] = {}
     for inst, s in summaries:
@@ -1467,15 +1475,20 @@ def _render_load_balance_sections(
 
     multi_model = len([k for k in by_model if k is not None]) > 1
     blocks: List[List[str]] = []
+    all_healthy = True
+    total_replicas = 0
     for model, group in by_model.items():
         if len(group) < 2:
             continue
+        total_replicas += len(group)
         results = _load_balance_check_for_group(group)
         if not results:
             continue
 
         n_checks = len(results)
         n_bad = sum(1 for _, _, is_bad in results if is_bad)
+        if n_bad > 0:
+            all_healthy = False
         suffix = f"  {DIM}(× {len(group)} replicas){RESET}"
         if multi_model and model:
             head = f"{BOLD}▸ Load balance  {short_model_name(model)}{RESET}{suffix}"
@@ -1490,6 +1503,11 @@ def _render_load_balance_sections(
                 icon = f"{RED}⚠{RESET}" if bad else f"{GREEN}✓{RESET}"
                 block.append(f"  {icon} {label:<20} {detail}")
             blocks.append(block)
+
+    if all_healthy and len(blocks) > 1:
+        return [[f"{BOLD}▸ Load balance{RESET}  "
+                 f"{GREEN}✓ all {len(blocks)} model groups OK{RESET}  "
+                 f"{DIM}(× {total_replicas} replicas total){RESET}"]]
     return blocks
 
 
@@ -1637,19 +1655,19 @@ def render_table(instances: List[Instance], interval: float,
             f"{fmt(tpot_ms_all, '{:.1f}'):>6}ms"
         )
 
-        # Load balance — request-share / running / token-share asymmetry
-        # ("is one replica getting more than its fair share?"). Rendered first
-        # because it's the more actionable signal for production deployments;
-        # it points to the load balancer / sticky session / hash collision.
-        for group_lines in _render_load_balance_sections(summaries):
-            lines.append("")
-            lines.extend(group_lines)
-
-        # Imbalance check — performance asymmetry ("is one GPU slower than
-        # the others?"). KV pressure, slow TTFT/TPOT.
-        for group_lines in _render_imbalance_sections(summaries):
-            lines.append("")
-            lines.extend(group_lines)
+        # Load balance + Imbalance check — emit with smart spacing: blank
+        # separator before EXPANDED blocks (something failed and we want
+        # visual breathing room), but consecutive single-line summaries pack
+        # together without blanks to save vertical space on short terminals.
+        all_blocks = (_render_load_balance_sections(summaries)
+                      + _render_imbalance_sections(summaries))
+        prev_one_liner = False
+        for block in all_blocks:
+            is_one_liner = len(block) == 1
+            if not (prev_one_liner and is_one_liner):
+                lines.append("")
+            lines.extend(block)
+            prev_one_liner = is_one_liner
 
     if not have_first_sample:
         lines.append("")
