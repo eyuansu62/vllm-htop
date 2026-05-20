@@ -40,18 +40,28 @@ import argparse
 import atexit
 import json
 import re
+import select
 import shutil
 import socket
 import subprocess
 import sys
 import time
 import urllib.request
+
+# Non-blocking stdin for interactive keyboard shortcuts (htop-style). Available
+# on Unix only; on Windows we silently degrade to read-only output.
+try:
+    import termios
+    import tty
+    HAS_TTY_INPUT = True
+except ImportError:
+    HAS_TTY_INPUT = False
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "0.3.3"
+__version__ = "0.4.0"
 
 
 # ───────────────────────────── ANSI styling ──────────────────────────────
@@ -90,6 +100,66 @@ def leave_alt_screen() -> None:
     sys.stdout.write(ALT_SCREEN_LEAVE)
     sys.stdout.flush()
     _alt_screen_active = False
+
+
+# Interactive interval cycling — increase via `+`, decrease via `-`.
+# Picked so it covers "very tight monitoring" down to "background watcher."
+INTERVAL_CYCLE: List[float] = [0.5, 1.0, 2.0, 5.0, 10.0, 30.0]
+
+
+class KeyboardController:
+    """Non-blocking single-character stdin reader using termios + select.
+
+    Activates when stdin is a TTY; on Windows or non-TTY input it degrades to
+    a no-op (`get_key` always returns None). Restores the original terminal
+    attributes on context-manager exit, even if the body raises.
+    """
+
+    def __init__(self, enabled: bool = True) -> None:
+        self._enabled = enabled
+        self._old_attrs: Optional[List[Any]] = None
+        self._active = False
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    def __enter__(self) -> "KeyboardController":
+        if self._enabled and HAS_TTY_INPUT and sys.stdin.isatty():
+            try:
+                self._old_attrs = termios.tcgetattr(sys.stdin.fileno())
+                # cbreak: chars come through 1-at-a-time, but signals like
+                # Ctrl-C still work (unlike raw mode where they don't).
+                tty.setcbreak(sys.stdin.fileno())
+                self._active = True
+            except (termios.error, OSError):
+                self._active = False
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        if self._old_attrs is not None:
+            try:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN,
+                                  self._old_attrs)
+            except (termios.error, OSError):
+                pass
+        self._active = False
+
+    def get_key(self, timeout: float) -> Optional[str]:
+        """Wait up to `timeout` seconds for a keypress; return the char or None."""
+        if not self._active:
+            time.sleep(max(0.0, timeout))
+            return None
+        try:
+            ready, _, _ = select.select([sys.stdin], [], [], max(0.0, timeout))
+        except (OSError, ValueError):
+            return None
+        if not ready:
+            return None
+        try:
+            return sys.stdin.read(1)
+        except (OSError, ValueError):
+            return None
 
 # ───────────────────────── trend / sparkline config ──────────────────────
 HISTORY_LEN = 60          # rolling samples kept per metric (≈2 min @ 2s interval)
@@ -1183,7 +1253,7 @@ def render_detail(inst: Instance, cost: Optional[CostConfig] = None) -> None:
                                  f"{fmt_money(cost.compute_per_hour, cost.currency)}/h compute){RESET}")
         lines.append("")
 
-    lines.append(GRAY + "Ctrl-C to exit" + RESET)
+    lines.append(GRAY + "[q] quit  [space] pause  [+/-] interval  [d] toggle view  [r] refresh now" + RESET)
     sys.stdout.write("\n".join(lines) + "\n")
     sys.stdout.flush()
 
@@ -1702,9 +1772,41 @@ def render_table(instances: List[Instance], interval: float,
             nm = find_metric(snap.counters, frag)
             return snap.counters[nm] if nm else 0.0
 
+        # Compact mode when only compute is configured (no token cost, no
+        # Margin row). Shrinks a 5-line Cost block into 2 lines so short
+        # terminals can also fit the Cumulative section underneath.
+        compact_compute_only = cost.compute_enabled and not cost.token_enabled
+
         lines.append("")
-        lines.append(f"{BOLD}▸ Cost{RESET}  "
-                     f"{DIM}(estimated · sum across {len(instances)} replicas){RESET}")
+
+        if compact_compute_only:
+            src_suffix = " auto-detected" if cost.gpu_price_source == "auto" else ""
+            model = cost.gpu_model or "GPU"
+            vllm_up = vllm_uptime_seconds(instances)
+            life_chunk = ""
+            if vllm_up is not None and vllm_up > 0:
+                life_chunk = (f"  {DIM}·{RESET}  "
+                              f"{BOLD}{fmt_money(cost.for_seconds(vllm_up), cost.currency)}{RESET} "
+                              f"lifetime {DIM}({fmt_duration(vllm_up)}){RESET}")
+            lines.append(
+                f"{BOLD}▸ Cost{RESET}  "
+                f"≈ {BOLD}{fmt_money(cost.compute_per_hour, cost.currency)}/h{RESET} burn "
+                f"{DIM}({model} × {cost.num_gpus} @ {cost.currency}{cost.gpu_cost_hour:g}/h{src_suffix}){RESET}"
+                f"  {DIM}·{RESET}  "
+                f"{BOLD}{fmt_money(cost.for_seconds(uptime), cost.currency)}{RESET} "
+                f"this session {DIM}({fmt_duration(uptime)}){RESET}"
+                f"{life_chunk}"
+            )
+            lines.append(f"  {DIM}✦ pass --cost-in PRICE --cost-out PRICE to add token cost and Margin{RESET}")
+            # Skip the verbose block below; jump directly to Cumulative.
+            # We do this by falling through with both token_enabled and
+            # compute_enabled bypassed via the early `if compact_compute_only`
+            # below.
+
+        # Verbose header — only when not in compact mode
+        if not compact_compute_only:
+            lines.append(f"{BOLD}▸ Cost{RESET}  "
+                         f"{DIM}(estimated · sum across {len(instances)} replicas){RESET}")
 
         # Token-based
         if cost.token_enabled:
@@ -1733,8 +1835,8 @@ def render_table(instances: List[Instance], interval: float,
                 lines.append(f"    Current rate : {BOLD}{fmt_money(per_sec*60, cost.currency):>12}/min{RESET}  "
                              f"{DIM}({fmt_money(per_sec*3600, cost.currency)}/hour at current throughput){RESET}")
 
-        # Compute-based
-        if cost.compute_enabled:
+        # Compute-based — skipped when in compact mode (rendered inline above)
+        if cost.compute_enabled and not compact_compute_only:
             src = " — auto-detected, estimate" if cost.gpu_price_source == "auto" else ""
             model = cost.gpu_model or "GPU"
             lines.append(f"  {DIM}Compute-based  ({model} × {cost.num_gpus} @ "
@@ -1762,12 +1864,13 @@ def render_table(instances: List[Instance], interval: float,
                              f"{DIM}({fmt_money(revenue_per_sec*3600, cost.currency)}/h revenue vs "
                              f"{fmt_money(cost.compute_per_hour, cost.currency)}/h compute){RESET}")
 
-        # Hint when only one pricing model is on — explains the "missing"
-        # subsection the user might expect.
-        if cost.compute_enabled and not cost.token_enabled:
-            lines.append(f"  {DIM}✦ pass --cost-in PRICE --cost-out PRICE to also see token cost and Margin{RESET}")
-        elif cost.token_enabled and not cost.compute_enabled:
-            lines.append(f"  {DIM}✦ pass --gpu-cost-hour PRICE to also see compute cost and Margin{RESET}")
+        # Hint when only one pricing model is on. (Compact-compute already
+        # includes its own inline hint, so skip here.)
+        if not compact_compute_only:
+            if cost.compute_enabled and not cost.token_enabled:
+                lines.append(f"  {DIM}✦ pass --cost-in PRICE --cost-out PRICE to also see token cost and Margin{RESET}")
+            elif cost.token_enabled and not cost.compute_enabled:
+                lines.append(f"  {DIM}✦ pass --gpu-cost-hour PRICE to also see compute cost and Margin{RESET}")
 
     # ── Cumulative section ── (auto-hidden when terminal is too short)
     if have_data:
@@ -1840,7 +1943,7 @@ def render_table(instances: List[Instance], interval: float,
             legend_parts.append(f"DP{head}={url}")
     legend = "  ".join(legend_parts)
     lines.append(GRAY + "Legend: " + legend + RESET)
-    lines.append(GRAY + "Ctrl-C to exit" + RESET)
+    lines.append(GRAY + "[q] quit  [space] pause  [+/-] interval  [d] toggle view  [r] refresh now" + RESET)
     sys.stdout.write("\n".join(lines) + "\n")
     sys.stdout.flush()
 
@@ -2263,18 +2366,106 @@ def main() -> None:
     if use_alt:
         enter_alt_screen()
 
+    # Snap the current interval into the cycle so +/- step through neat values.
+    interval = args.interval
     try:
-        while True:
+        interval_idx = INTERVAL_CYCLE.index(interval)
+    except ValueError:
+        # User passed a custom value; find the nearest cycle slot.
+        interval_idx = min(range(len(INTERVAL_CYCLE)),
+                           key=lambda i: abs(INTERVAL_CYCLE[i] - interval))
+        interval = INTERVAL_CYCLE[interval_idx]
+
+    paused = False
+    force_refresh = False
+    status_msg = ""   # transient hint, e.g. "interval → 5.0s", "paused"
+
+    def do_render() -> None:
+        if mode == "json":
+            render_json(instances, interval=interval, cost=cost)
+        elif mode == "table":
+            render_table(instances, interval=interval, cost=cost)
+        else:
+            render_detail(instances[0], cost=cost)
+        # Append transient status / pause indicator below the legend.
+        if paused or status_msg:
+            bits: List[str] = []
+            if paused:
+                bits.append(f"{YELLOW}⏸ PAUSED — press SPACE to resume{RESET}")
+            if status_msg:
+                bits.append(f"{DIM}{status_msg}{RESET}")
+            sys.stdout.write("  " + "   ".join(bits) + "\n")
+            sys.stdout.flush()
+
+    try:
+        # Only enable interactive keyboard when we're in the alt-screen
+        # rendering mode (table/detail + interactive TTY). For JSON output
+        # or piped output, leave stdin alone so the user's shell still
+        # receives their keystrokes.
+        with KeyboardController(enabled=use_alt) as kb:
+            # First fetch synchronously so the first render has real data.
             fetch_all(instances, timeout=args.timeout)
-            if mode == "json":
-                render_json(instances, interval=args.interval, cost=cost)
-            elif mode == "table":
-                render_table(instances, interval=args.interval, cost=cost)
-            else:
-                render_detail(instances[0], cost=cost)
+            do_render()
             if args.once:
-                break
-            time.sleep(args.interval)
+                return
+
+            last_fetch = time.time()
+            while True:
+                now = time.time()
+                # Refresh tick (only when not paused; force_refresh bypasses pause).
+                need_refresh = force_refresh or (
+                    not paused and (now - last_fetch) >= interval
+                )
+                if need_refresh:
+                    fetch_all(instances, timeout=args.timeout)
+                    last_fetch = time.time()
+                    force_refresh = False
+                    status_msg = ""   # clear after one render
+                    do_render()
+
+                # Sleep until next tick OR until a key is pressed — whichever
+                # happens first. Cap at 0.2s so the UI feels responsive even
+                # at long intervals.
+                budget = (last_fetch + interval) - time.time() if not paused else 1.0
+                wait = max(0.05, min(0.2, budget))
+                key = kb.get_key(wait) if kb.active else None
+                if key is None:
+                    continue
+
+                # ── Keyboard handling ──
+                if key in ("q", "Q", "\x03", "\x04"):       # q, Q, Ctrl-C, Ctrl-D
+                    break
+                elif key == " ":
+                    paused = not paused
+                    status_msg = "resumed" if not paused else ""
+                    do_render()
+                elif key in ("+", "="):
+                    # `=` lets users hit + without shift
+                    if interval_idx > 0:
+                        interval_idx -= 1
+                        interval = INTERVAL_CYCLE[interval_idx]
+                        status_msg = f"interval → {interval}s (faster)"
+                        do_render()
+                elif key in ("-", "_"):
+                    if interval_idx < len(INTERVAL_CYCLE) - 1:
+                        interval_idx += 1
+                        interval = INTERVAL_CYCLE[interval_idx]
+                        status_msg = f"interval → {interval}s (slower)"
+                        do_render()
+                elif key in ("d", "D"):
+                    # Toggle between table and detail (only meaningful with ≥1 replica)
+                    if mode == "table":
+                        mode = "detail"
+                        status_msg = "view → detail (first replica only)"
+                    elif mode == "detail":
+                        mode = "table" if len(instances) >= 2 else "detail"
+                        status_msg = ("view → table" if mode == "table"
+                                      else "only one replica; staying in detail")
+                    do_render()
+                elif key in ("r", "R"):
+                    force_refresh = True
+                    status_msg = "refresh"
+                # All other keys ignored silently.
     except KeyboardInterrupt:
         pass
     finally:

@@ -5,6 +5,45 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-05-20
+
+### Added
+- **Interactive keyboard shortcuts** in the live monitoring loop (htop-style; zero new config required):
+
+  | Key | Action |
+  |---|---|
+  | `q` / `Q` / Ctrl-C / Ctrl-D | Graceful quit |
+  | `Space` | Pause / resume refresh (last frame stays on screen) |
+  | `+` / `=` | Faster refresh (cycles through 0.5s / 1s / 2s / 5s / 10s / 30s) |
+  | `-` / `_` | Slower refresh (same cycle, reverse) |
+  | `d` | Toggle between table view and detail view at runtime |
+  | `r` | Force a refresh now (bypasses pause) |
+
+  Implementation uses stdlib `termios` + `tty` + `select` in cbreak mode — no curses, no external library, no permanent config files. On Windows or non-TTY stdin the loop degrades silently to passive refresh (original behaviour).
+
+  A transient status line appears below the legend when a key triggers an action (e.g. `interval → 5.0s (slower)`) and clears on the next refresh, so the user gets visible feedback.
+
+### Changed
+- **Compact Cost section when only compute pricing is configured** (no `--cost-in`/`--cost-out` passed). Collapses a 5-line block:
+  ```
+  ▸ Cost  (estimated · sum across 8 replicas)
+    Compute-based  (NVIDIA H20-3e × 8 @ $3.5/h — auto-detected, estimate)
+      Burn rate    :       $28.00/hour  (paid whether busy or idle)
+      This session :        $1.61  (over 3m27s)
+    ✦ pass --cost-in PRICE ...
+  ```
+  into 2 lines:
+  ```
+  ▸ Cost  ≈ $28.00/h burn (NVIDIA H20-3e × 8 @ $3.5/h auto-detected)  ·  $1.61 this session (3m27s)  [·  $54.24 lifetime (2h00m)]
+    ✦ pass --cost-in PRICE --cost-out PRICE to add token cost and Margin
+  ```
+  Saves 3 vertical rows. Verbose 5-line format is still used when token pricing is also on (the Margin row needs structured layout). Helps fit the full output including the Cumulative section on shorter terminals.
+
+## [0.3.4] — 2026-05-20
+
+### Fixed
+- **0.3.3's wheel was built before the all-healthy collapse change landed in the working tree** — the published artifact had the `prev_one_liner` packing helper but was missing the `if all_healthy and len(blocks) > 1` branch in `_render_imbalance_sections` and `_render_load_balance_sections`. Verified via `uvx --from "vllm-htop==0.3.3" python -c "..."`. Re-published with the same intended functionality.
+
 ## [0.3.3] — 2026-05-20
 
 ### Changed
