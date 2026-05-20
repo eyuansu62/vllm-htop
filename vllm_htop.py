@@ -61,7 +61,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "0.4.2"
+__version__ = "0.4.3"
 
 
 # ───────────────────────────── ANSI styling ──────────────────────────────
@@ -2129,10 +2129,17 @@ def render_table(instances: List[Instance], interval: float,
             term_h = shutil.get_terminal_size((100, 24)).lines
         except (AttributeError, OSError):
             term_h = 24
-        # Approx height of Cumulative + Legend so we can decide ahead of time.
-        cumulative_h = 5 + len(instances) + 1   # header + rule + rule + rows + rule + ALL
-        legend_h = 3                            # blank + Legend + Ctrl-C
-        projected = len(lines) + cumulative_h + legend_h
+        # Project the full remaining output so we can decide whether
+        # Cumulative fits. Previously we under-counted (forgot events +
+        # the multi-line basis footer) and let Cumulative render even
+        # when total content would overflow the viewport — pushing the
+        # title bar off the top.
+        cumulative_h = 1 + 4 + len(instances) + 1   # blank + (header + rule + col header + rule) + rows + (rule + ALL)
+        _ensure_event_log()
+        n_events = min(5, len(EVENT_LOG)) if EVENT_LOG is not None else 0
+        events_h = (2 + n_events) if n_events > 0 else 0   # blank + header + N event lines
+        footer_h = 5                                # blank + Legend + Runtime basis + Cost basis + shortcuts
+        projected = len(lines) + cumulative_h + events_h + footer_h
 
         if projected <= term_h:
             lines.append("")

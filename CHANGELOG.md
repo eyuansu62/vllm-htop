@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.3] — 2026-05-20
+
+### Fixed
+- **Cumulative-section height projection was under-counting**, letting it render even when the total content would overflow the viewport — pushing the title bar and summary header off the top of the screen on short terminals (notably 13" MacBook defaults). Projection now correctly includes the Recent events section (when it has entries) and the full 4-line basis footer + shortcuts, so on a tight terminal Cumulative is suppressed earlier and the most important top-of-screen info stays visible. Trade-off: when events fire on a short terminal, Cumulative now hides more aggressively — use `--output json` to see full cumulative data or resize/full-screen the terminal.
+
 ## [0.4.2] — 2026-05-20
 
 ### Added
