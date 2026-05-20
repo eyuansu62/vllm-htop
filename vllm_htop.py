@@ -61,7 +61,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "0.4.0"
+__version__ = "0.4.2"
 
 
 # ───────────────────────────── ANSI styling ──────────────────────────────
@@ -766,6 +766,14 @@ def fetch_all(instances: List[Instance], timeout: float = 5.0) -> None:
     for url, raw, err in results:
         for inst in by_url[url]:
             if err is not None:
+                # Record a fetch-failure event the first time it happens
+                # (within the dedupe window). STALE if we have an older
+                # snapshot to show; DOWN if we never did.
+                cat = "STALE" if inst.snapshot is not None else "DOWN"
+                severity = "warn" if cat == "STALE" else "alert"
+                record_event(cat, inst.name,
+                             f"{type(err).__name__}: {str(err)[:60]}",
+                             severity=severity)
                 inst.error = f"{type(err).__name__}: {err}"
             else:
                 _apply_raw(inst, raw)
@@ -1020,6 +1028,123 @@ def sparkline(values: List[float], width: int = SPARK_WIDTH,
     return " " * pad + "".join(out)
 
 
+# ─────────────────────────── event log ──────────────────────────────────
+# Transient operational events (HOT transitions, sticky skew, STALE blips,
+# DOWN). Survives across frames so a problem that flashes for one poll
+# isn't lost — useful when you walked away for a minute and come back
+# wondering what happened.
+
+@dataclass
+class Event:
+    timestamp: float
+    category: str            # "HOT" / "STICKY" / "SLOW" / "STALE" / "DOWN" / "INFO"
+    replica: Optional[str]   # replica name or None for cluster-wide
+    message: str
+    severity: str = "warn"   # "warn" (yellow) / "alert" (red) / "info" (dim)
+
+
+# Bounded ring buffer of recent events. Capped at 50 so memory stays trivial.
+EVENT_LOG: "collections.deque[Event]" = None  # initialized lazily below
+
+
+def _ensure_event_log() -> None:
+    """Lazy-init the event log so `import collections` is the only added stdlib
+    dep on a hot path (rather than always importing at module level)."""
+    global EVENT_LOG
+    if EVENT_LOG is None:
+        import collections
+        EVENT_LOG = collections.deque(maxlen=50)
+
+
+# How long to dedupe the same (category, replica) signal before logging again.
+# Without this, a HOT replica would spam the log every poll.
+EVENT_DEDUPE_SECS = 60.0
+
+
+def record_event(category: str, replica: Optional[str], message: str,
+                 severity: str = "warn") -> None:
+    """Append to the event log, deduping a recent same-category-same-replica."""
+    _ensure_event_log()
+    now = time.time()
+    for ev in EVENT_LOG:
+        if (ev.category == category and ev.replica == replica
+                and (now - ev.timestamp) < EVENT_DEDUPE_SECS):
+            return
+    EVENT_LOG.append(Event(now, category, replica, message, severity))
+
+
+def render_event_log(max_lines: int = 5) -> List[str]:
+    """Render the event log as a list of formatted lines, newest at the bottom.
+
+    Empty log → return [] (caller appends nothing — no wasted section header).
+    """
+    _ensure_event_log()
+    if not EVENT_LOG:
+        return []
+    events_to_show = list(EVENT_LOG)[-max_lines:]
+    out = [f"{BOLD}▸ Recent events{RESET}  "
+           f"{DIM}(last {len(events_to_show)} of {len(EVENT_LOG)}, deduped ~60s){RESET}"]
+    for ev in events_to_show:
+        ts = datetime.fromtimestamp(ev.timestamp).strftime("%H:%M:%S")
+        if ev.severity == "alert":
+            cat_color = RED
+        elif ev.severity == "warn":
+            cat_color = YELLOW
+        else:
+            cat_color = DIM
+        replica_str = f"{ev.replica}" if ev.replica else "—"
+        out.append(f"  {DIM}{ts}{RESET}  "
+                   f"{cat_color}{ev.category:<7}{RESET}  "
+                   f"{replica_str:<24}  "
+                   f"{DIM}{ev.message}{RESET}")
+    return out
+
+
+def reactor_core(pct: Optional[float], rows: int = 4, cols: int = 24) -> List[str]:
+    """Return `rows` lines visualizing utilization as a 2D filled grid.
+
+    Cells fill bottom-up (like a fuel tank), so a half-full grid clearly
+    shows the lower half saturated and the top empty. Used in the detail
+    view for KV cache, where there's room for a striking visual that
+    catches the eye before users read the number itself.
+
+    Color thresholds match the rest of the tool: green < 65%, yellow < 85%,
+    red ≥ 85%.
+    """
+    if pct is None:
+        return [f"{GRAY}{'·' * cols}{RESET}" for _ in range(rows)]
+    pct = max(0.0, min(100.0, pct))
+    total = rows * cols
+    filled = int(round(pct / 100.0 * total))
+    color = RED if pct > 85 else YELLOW if pct > 65 else GREEN
+
+    out: List[str] = []
+    for r in range(rows):
+        # Row r counted from the BOTTOM of the visible grid → fill bottom up.
+        rows_from_bottom_to_here = rows - 1 - r
+        cells_below = rows_from_bottom_to_here * cols
+        line = []
+        for c in range(cols):
+            idx = cells_below + c
+            if idx < filled:
+                line.append(f"{color}█{RESET}")
+            else:
+                line.append(f"{GRAY}·{RESET}")
+        out.append("".join(line))
+    return out
+
+
+def mini_bar(pct: Optional[float], width: int = 8) -> str:
+    """Compact 8-cell ▇/░ bar for the summary header. No color, just glyph
+    density — color is applied separately by the caller so the bar can
+    inherit the surrounding KV%-style threshold coloring."""
+    if pct is None:
+        return "░" * width
+    pct = max(0.0, min(100.0, pct))
+    filled = int(round(pct / 100.0 * width))
+    return "▇" * filled + "░" * (width - filled)
+
+
 def bar(pct: Optional[float], width: int = 22) -> str:
     if pct is None:
         return " " * width
@@ -1038,6 +1163,57 @@ def _cache_color(p: Optional[float]) -> str:
     """Higher is better for prefix-cache hit rate."""
     if p is None: return ""
     return GREEN if p >= 60 else YELLOW if p >= 30 else RED
+
+
+def _health_label(inst: "Instance", smry: Optional[Dict[str, Any]],
+                  ttft_median_ms: Optional[float] = None,
+                  tpot_median_ms: Optional[float] = None) -> str:
+    """Per-replica health classifier. Returns a colored status string.
+
+    `HOT` fires when a replica trips ≥2 of these signals at once. Single
+    isolated signals stay as `OK` (a momentarily-spiking metric isn't yet
+    a problem); two or more is the line between "noise" and "actually
+    something's wrong on this replica":
+
+      * KV cache > 85%      (running out of space)
+      * Waiting    > 5      (queue building up)
+      * Swapped    > 0      (memory pressure preempting requests)
+      * TTFT P95  > 2× the group median  (slow replica)
+      * TPOT P95  > 2× the group median  (slow decode)
+
+    The two-signal threshold is empirical: most healthy replicas trip 0,
+    one stressed replica might trip 1 transiently, but 2+ together almost
+    always means "this is the bad actor in the cluster."
+    """
+    if smry is None:
+        return f"{RED}DOWN  {RESET}"
+    if inst.error:
+        return f"{YELLOW}STALE {RESET}"
+
+    bad = 0
+    kv = smry["kv_pct"]
+    if kv is not None and kv > 85:
+        bad += 1
+    if (smry["waiting"] or 0) > 5:
+        bad += 1
+    if (smry["swapped"] or 0) > 0:
+        bad += 1
+    if (ttft_median_ms and smry["ttft_p95"] is not None
+            and smry["ttft_p95"] * 1000 > 2.0 * ttft_median_ms):
+        bad += 1
+    if (tpot_median_ms and smry["tpot_p95"] is not None
+            and smry["tpot_p95"] * 1000 > 2.0 * tpot_median_ms):
+        bad += 1
+
+    if bad >= 2:
+        # Log this — within 60s dedupe means we don't spam, but we do
+        # capture HOT episodes for later inspection.
+        kv_str = f"KV {kv:.0f}%" if kv is not None else ""
+        wait_str = f"Wait {smry['waiting']:.0f}" if (smry['waiting'] or 0) > 0 else ""
+        sig_str = " · ".join(s for s in (kv_str, wait_str) if s) or f"{bad} signals"
+        record_event("HOT", inst.name, sig_str, severity="alert")
+        return f"{RED}HOT   {RESET}"
+    return f"{GREEN}OK    {RESET}"
 
 
 def _wait_color(w: Optional[float]) -> str:
@@ -1107,7 +1283,11 @@ def render_detail(inst: Instance, cost: Optional[CostConfig] = None) -> None:
         lines.append(f"  Waiting (queue)   : {wc}{BOLD}{fmt(smry['waiting'], '{:.0f}'):>6}{RESET}")
         lines.append(f"  Swapped           : {sc}{fmt(smry['swapped'], '{:.0f}'):>6}{RESET}")
         if smry["kv_pct"] is not None:
-            lines.append(f"  KV cache usage    :  {kc}{BOLD}{smry['kv_pct']:>5.1f}%{RESET}  {bar(smry['kv_pct'])}")
+            lines.append(f"  KV cache usage    :  {kc}{BOLD}{smry['kv_pct']:>5.1f}%{RESET}")
+            # 2D grid visualization — striking enough to catch the eye before
+            # the user even reads the number.
+            for grid_row in reactor_core(smry["kv_pct"], rows=4, cols=24):
+                lines.append(f"                       {grid_row}")
         else:
             lines.append(f"  KV cache usage    :     —")
         # Prefix cache hit rate (only if vLLM exposes the counter at all)
@@ -1253,6 +1433,12 @@ def render_detail(inst: Instance, cost: Optional[CostConfig] = None) -> None:
                                  f"{fmt_money(cost.compute_per_hour, cost.currency)}/h compute){RESET}")
         lines.append("")
 
+    # ── Recent events ── (only when there's actually something to show)
+    event_lines = render_event_log(max_lines=5)
+    if event_lines:
+        lines.extend(event_lines)
+        lines.append("")
+
     lines.append(GRAY + "[q] quit  [space] pause  [+/-] interval  [d] toggle view  [r] refresh now" + RESET)
     sys.stdout.write("\n".join(lines) + "\n")
     sys.stdout.flush()
@@ -1335,6 +1521,9 @@ def _imbalance_check_for_group(
         if bad:
             detail = (f"{BOLD}{outlier.name}{RESET}: {t_max:.0f}ms is "
                       f"{ratio:.1f}× median ({t_med:.0f}ms)")
+            record_event("SLOW", outlier.name,
+                         f"TTFT {t_max:.0f}ms vs cluster median {t_med:.0f}ms "
+                         f"({ratio:.1f}×)", severity="warn")
         else:
             detail = f"median {t_med:.0f}ms, max {t_max:.0f}ms ({ratio:.1f}×)"
         results.append(("slow-replica (TTFT)", detail, bad))
@@ -1351,6 +1540,9 @@ def _imbalance_check_for_group(
         if bad:
             detail = (f"{BOLD}{outlier.name}{RESET}: {t_max:.1f}ms is "
                       f"{ratio:.1f}× median ({t_med:.1f}ms)")
+            record_event("SLOW", outlier.name,
+                         f"TPOT {t_max:.1f}ms vs cluster median {t_med:.1f}ms "
+                         f"({ratio:.1f}×)", severity="warn")
         else:
             detail = f"median {t_med:.1f}ms, max {t_max:.1f}ms ({ratio:.1f}×)"
         results.append(("slow-decode (TPOT)", detail, bad))
@@ -1473,6 +1665,10 @@ def _load_balance_check_for_group(
                 sticky_detail = (f"{BOLD}{sticky_outlier.name}{RESET} handled "
                                  f"{lmax:.0f}% of requests for {int(elapsed_min)}s "
                                  f"(median {lmed:.0f}%)")
+                record_event("STICKY", sticky_outlier.name,
+                             f"{lmax:.0f}% req share for {int(elapsed_min)}s "
+                             f"(median {lmed:.0f}%)",
+                             severity="alert")
 
         bad = sticky_bad
         if sticky_bad:
@@ -1600,6 +1796,53 @@ def render_table(instances: List[Instance], interval: float,
     health = f"{GREEN}{up}/{n} up{RESET}" if up == n else f"{RED}{up}/{n} up{RESET}"
     lines.append(f"{BOLD}{CYAN}vLLM DP Monitor{RESET}  {DIM}│{RESET}  "
                  f"{health}  {DIM}│{RESET}  {ts}  {DIM}(interval={interval}s){RESET}")
+
+    # ── Summary header bar ── (highest-density signal at a glance)
+    ok = [s for _, s in summaries if s is not None]
+    sum_qps  = sum((s["req_rps"]    or 0) for s in ok)
+    sum_in   = sum((s["prompt_rps"] or 0) for s in ok)
+    sum_out  = sum((s["gen_rps"]    or 0) for s in ok)
+    sum_wait = sum((s["waiting"] or 0) for s in ok)
+    sum_run  = sum((s["running"] or 0) for s in ok)
+    kvs_all  = [s["kv_pct"] for s in ok if s["kv_pct"] is not None]
+    max_kv   = max(kvs_all) if kvs_all else None
+
+    # Lifetime token total (vLLM counters — always works, no wallclock needed).
+    life_in_total = life_out_total = 0.0
+    for inst in instances:
+        if inst.snapshot is None:
+            continue
+        for frag, target in (("prompt_tokens", "in"),
+                             ("generation_tokens", "out")):
+            nm = find_metric(inst.snapshot.counters, frag)
+            if nm:
+                if target == "in":
+                    life_in_total += inst.snapshot.counters[nm]
+                else:
+                    life_out_total += inst.snapshot.counters[nm]
+    life_total = life_in_total + life_out_total
+
+    kv_color = _kv_color(max_kv)
+    burn_chunk = ""
+    if cost is not None and cost.compute_enabled:
+        burn_chunk = (f"  {DIM}│{RESET}  "
+                      f"{DIM}Burn{RESET} "
+                      f"{BOLD}{fmt_money(cost.compute_per_hour, cost.currency)}/h{RESET}")
+
+    lines.append(
+        f"  {DIM}QPS{RESET} {BOLD}{sum_qps:>5.1f}{RESET}"
+        f"  {DIM}│{RESET}  {DIM}in{RESET} {BOLD}{humanize(sum_in):>5}{RESET}{DIM}/s{RESET}"
+        f"  {DIM}│{RESET}  {DIM}out{RESET} {BOLD}{humanize(sum_out):>5}{RESET}{DIM}/s{RESET}"
+        f"  {DIM}│{RESET}  {DIM}Run{RESET} {BOLD}{sum_run:>3.0f}{RESET}"
+        f"  {DIM}Wait{RESET} {fmt(sum_wait, '{:.0f}'):>3}"
+        f"  {DIM}│{RESET}  {DIM}KV{RESET} {kv_color}{BOLD}{fmt(max_kv, '{:.1f}'):>5}%{RESET} "
+        f"{kv_color}{mini_bar(max_kv)}{RESET}"
+        f"{burn_chunk}"
+        f"  {DIM}│{RESET}  {DIM}Lifetime{RESET} "
+        f"{BOLD}{humanize(life_total)}{RESET} "
+        f"{DIM}tok ({humanize(life_in_total)} in + {humanize(life_out_total)} out){RESET}"
+    )
+
     lines.append(rule)
     # Only show the Cache% column when at least one replica exposes prefix-cache
     # metrics — saves table width on older vLLM versions that don't have them.
@@ -1619,6 +1862,14 @@ def render_table(instances: List[Instance], interval: float,
     lines.append(f"{DIM} {'DP':<{name_w}}  Status   Run  Wait  Req/s  Req%  Swap   KV%{cache_hdr}      in tok/s  out tok/s   TTFT-P95  TPOT-P95{RESET}")
     lines.append(rule)
 
+    # Cluster-wide medians for HOT detection (compare each replica vs its peers).
+    ttft_vals_ms = [s["ttft_p95"] * 1000 for _, s in summaries
+                    if s and s.get("ttft_p95") is not None]
+    tpot_vals_ms = [s["tpot_p95"] * 1000 for _, s in summaries
+                    if s and s.get("tpot_p95") is not None]
+    ttft_median_ms = _median(ttft_vals_ms) if len(ttft_vals_ms) >= 2 else None
+    tpot_median_ms = _median(tpot_vals_ms) if len(tpot_vals_ms) >= 2 else None
+
     have_first_sample = False
     for inst, smry in summaries:
         if smry is None:
@@ -1635,7 +1886,7 @@ def render_table(instances: List[Instance], interval: float,
         wc = _wait_color(smry["waiting"])
         sc = RED if (smry["swapped"] or 0) > 0 else ""
         kc = _kv_color(smry["kv_pct"])
-        status = f"{YELLOW}STALE {RESET}" if inst.error else f"{GREEN}OK    {RESET}"
+        status = _health_label(inst, smry, ttft_median_ms, tpot_median_ms)
         ttft_ms = (smry["ttft_p95"] * 1000) if smry["ttft_p95"] is not None else None
         tpot_ms = (smry["tpot_p95"] * 1000) if smry["tpot_p95"] is not None else None
 
@@ -1941,8 +2192,50 @@ def render_table(instances: List[Instance], interval: float,
             names = [i.name for i in insts]
             head = f"{{{','.join(names)}}}" if len(names) > 1 else names[0]
             legend_parts.append(f"DP{head}={url}")
+    # ── Recent events (HOT / STICKY / SLOW / STALE / DOWN) ──
+    # Renders only when there's something to show. Captures transient
+    # signals (a momentary STALE, a brief HOT spike) that the table-row
+    # status alone might lose between frames.
+    event_lines = render_event_log(max_lines=5)
+    if event_lines:
+        lines.append("")
+        lines.extend(event_lines)
+
     legend = "  ".join(legend_parts)
+    lines.append("")
     lines.append(GRAY + "Legend: " + legend + RESET)
+
+    # ── Basis footer — make implicit assumptions visible ──
+    # Without this users wonder "why no Lifetime compute cost?" or "where do
+    # these GPU $/h numbers come from?". Spelling out the source up front is
+    # cheaper than re-explaining in support / GitHub issues every time.
+    vllm_up = vllm_uptime_seconds(instances) if any(i.snapshot for i in instances) else None
+    if vllm_up is not None and vllm_up > 0:
+        runtime_basis = f"vLLM uptime ({fmt_duration(vllm_up)}, from process_start_time_seconds)"
+    else:
+        first_seens = [i.first_seen for i in instances if i.first_seen is not None]
+        if first_seens:
+            atch = time.time() - min(first_seens)
+            runtime_basis = (f"observed since vllm-htop attached ({fmt_duration(atch)}) "
+                             f"— vLLM uptime unavailable in DP/multiproc mode")
+        else:
+            runtime_basis = "no data yet"
+    if cost is not None and cost.compute_enabled:
+        src = "auto-detected" if cost.gpu_price_source == "auto" else "user-provided"
+        if cost.token_enabled:
+            cost_basis = (f"GPU @ {cost.currency}{cost.gpu_cost_hour:g}/h ({src}, ±30%) "
+                          f"+ token {cost.currency}{cost.input_per_m:g}/{cost.output_per_m:g}/M")
+        else:
+            cost_basis = (f"GPU @ {cost.currency}{cost.gpu_cost_hour:g}/h ({src}, ±30%) "
+                          f"— pass --cost-in/--cost-out for token cost")
+    elif cost is not None and cost.token_enabled:
+        cost_basis = (f"token {cost.currency}{cost.input_per_m:g}/{cost.output_per_m:g}/M "
+                      f"— pass --gpu-cost-hour for compute cost")
+    else:
+        cost_basis = "no pricing configured (pass --cost-in/--cost-out or --gpu-cost-hour)"
+    lines.append(GRAY + f"Runtime basis: {runtime_basis}" + RESET)
+    lines.append(GRAY + f"Cost basis:    {cost_basis}" + RESET)
+
     lines.append(GRAY + "[q] quit  [space] pause  [+/-] interval  [d] toggle view  [r] refresh now" + RESET)
     sys.stdout.write("\n".join(lines) + "\n")
     sys.stdout.flush()

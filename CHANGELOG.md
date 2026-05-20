@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.2] — 2026-05-20
+
+### Added
+- **Reactor-core KV cache grid** in the single-instance detail view — replaces the linear `█████░░░` bar with a 4-row × 24-column grid that fills bottom-up like a fuel tank. Same color thresholds (green < 65% / yellow < 85% / red ≥ 85%). The 2D grid grabs the eye before the user even reads the percentage. Detail view only — the table view still uses the linear column.
+- **▸ Recent events** scrolling log section — captures transient signals (HOT entry, sticky-skew detection, slow-replica TTFT/TPOT, STALE / DOWN fetches) so a problem that flashed for one poll isn't lost. Capped at 50 entries internally, shows the 5 most recent; same-`(category, replica)` events are deduped within a 60-second window to avoid spam. The section renders only when there's something to show, so the healthy steady state is unaffected. Event categories:
+  - `HOT` (alert / red) — a replica trips ≥2 of: KV > 85%, Wait > 5, Swapped > 0, slow TTFT, slow TPOT
+  - `STICKY` (alert / red) — request share max/median > 1.5× for ≥10s
+  - `SLOW` (warn / yellow) — replica's TTFT or TPOT P95 > 1.5× cluster median
+  - `STALE` (warn / yellow) — fetch failed but a previous snapshot exists
+  - `DOWN` (alert / red) — fetch failed with no prior snapshot
+
+## [0.4.1] — 2026-05-20
+
+### Added
+- **Summary header bar** below the title — single line with the highest-density signal: total QPS, in/out tok/s, current Run/Wait, max KV% with a mini block-bar, compute burn rate, and lifetime token total (with in/out breakdown). Lets you read the cluster's pulse without scanning every replica row.
+- **HOT status badge** in the DP column — replaces `OK` with `HOT` (red) when a replica trips ≥2 of these signals at once: KV > 85%, Wait > 5, Swapped > 0, TTFT P95 > 2× cluster median, TPOT P95 > 2× cluster median. Single signals stay as `OK` (transient spikes aren't problems); two or more is the line between "noise" and "this is the bad actor."
+- **`Runtime basis` and `Cost basis` footer** — two short lines making implicit assumptions explicit. When vLLM exposes `process_start_time_seconds`, runtime basis cites it; otherwise it cites "observed since vllm-htop attached — vLLM uptime unavailable in DP/multiproc mode" so users immediately understand why Lifetime compute cost is missing. Cost basis cites which pricing modes are configured + their source (auto / user-provided / OpenRouter / none).
+
 ## [0.4.0] — 2026-05-20
 
 ### Added
