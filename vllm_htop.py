@@ -61,7 +61,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "0.4.6"
+__version__ = "0.4.7"
 
 
 # ───────────────────────────── ANSI styling ──────────────────────────────
@@ -1919,16 +1919,18 @@ def render_table(instances: List[Instance], interval: float,
     cache_chunk = ""
     if _any_cache_metric:
         cc = _cache_color(agg_cache)
-        # Label "Cache" with the value; when only the lifetime fallback is
-        # available (no traffic this window), mark it dim with a "life"
-        # suffix so the user knows it's not the live rate.
+        # Label "KV-Hit" — pairs with the adjacent "KV" (fill %) so the
+        # reader sees "fill vs hit" rather than two ambiguous Cache fields.
+        # When only the lifetime fallback is available (no traffic this
+        # window), mark it dim with a "life" suffix so the user knows
+        # it's not the live rate.
         if agg_cache_win is None and agg_cache_life is not None:
             cache_chunk = (f"  {DIM}│{RESET}  "
-                           f"{DIM}Cache{RESET} {cc}{BOLD}{fmt(agg_cache, '{:.0f}'):>3}%{RESET}"
+                           f"{DIM}KV-Hit{RESET} {cc}{BOLD}{fmt(agg_cache, '{:.0f}'):>3}%{RESET}"
                            f" {DIM}life{RESET}")
         else:
             cache_chunk = (f"  {DIM}│{RESET}  "
-                           f"{DIM}Cache{RESET} {cc}{BOLD}{fmt(agg_cache, '{:.0f}'):>3}%{RESET}")
+                           f"{DIM}KV-Hit{RESET} {cc}{BOLD}{fmt(agg_cache, '{:.0f}'):>3}%{RESET}")
 
     burn_chunk = ""
     if cost is not None and cost.compute_enabled:
@@ -1952,15 +1954,19 @@ def render_table(instances: List[Instance], interval: float,
     )
 
     lines.append(rule)
-    # Only show the Cache% column when at least one replica exposes prefix-cache
-    # metrics — saves table width on older vLLM versions that don't have them.
+    # Only show the KV-Hit% column when at least one replica exposes
+    # prefix-cache metrics — saves table width on older vLLM versions
+    # that don't have them. Labeled "KV-Hit" rather than "Cache" so it
+    # pairs unambiguously with the adjacent "KV%" (fill) column —
+    # otherwise the two %-columns both labeled "cache-something" make
+    # the reader pause every time.
     show_cache = any(
         smry and (smry.get("cache_hit_pct") is not None
                   or smry.get("cache_hit_pct_life") is not None)
         for _, smry in summaries
     )
-    cache_hdr = f"  Cache%" if show_cache else ""
-    cache_pad = 8 if show_cache else 0
+    cache_hdr = f"  KV-Hit%" if show_cache else ""
+    cache_pad = 9 if show_cache else 0
     # +13 for the two new columns (Req/s + Req%) inserted between Wait and Swap
     rule = GRAY + "─" * (86 + 13 + pad_extra + cache_pad) + RESET
     # Pre-compute totals for Req/s and Req% so each row knows its share.

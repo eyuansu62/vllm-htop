@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.7] — 2026-05-21
+
+### Changed
+- **Renamed the prefix-cache hit-rate field from `Cache` to `KV-Hit`** in both the summary header bar and the table column (`Cache%` → `KV-Hit%`). The previous label sat right next to `KV` (KV cache fill %) and both used "cache" + "%", so the reader had to stop and think: one means "how full" (lower is better, the swap warning), the other means "how often was it reused" (higher is better, the throughput win). `KV-Hit` pairs explicitly with `KV` as the "fill vs hit" dual, and the direction-of-good is immediately readable. JSON keys are unchanged (`prefix_cache_hit_pct_window` / `prefix_cache_hit_pct_lifetime`) — the rename is purely visual.
+
 ## [0.4.6] — 2026-05-21
 
 ### Added
