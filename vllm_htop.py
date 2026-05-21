@@ -61,7 +61,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "0.4.3"
+__version__ = "0.4.4"
 
 
 # ───────────────────────────── ANSI styling ──────────────────────────────
@@ -1777,6 +1777,42 @@ def _render_load_balance_sections(
     return blocks
 
 
+def _compact_alert_blocks(blocks: List[List[str]]) -> List[List[str]]:
+    """Squash expanded LB/IMB blocks down to header-only lines.
+
+    Used on short terminals where the full multi-line detail would push
+    the table header off the top of the viewport. The detail isn't lost
+    — every "bad" check that triggers expansion (STICKY skew, SLOW TTFT,
+    SLOW TPOT) also records into the Recent events log, which we still
+    render below. So the trade-off is: lose 3–4 lines of duplicated
+    in-place detail; keep the alert summary + the events log.
+    """
+    out: List[List[str]] = []
+    for b in blocks:
+        if len(b) > 1:
+            # Header line already contains the "⚠ N/M failed" badge —
+            # append a tiny pointer so the user knows where to look.
+            out.append([f"{b[0]}  {DIM}↓ details in Recent events{RESET}"])
+        else:
+            out.append(b)
+    return out
+
+
+def _blocks_as_lines(blocks: List[List[str]]) -> List[str]:
+    """Flatten LB/IMB blocks into output lines with smart blank spacing:
+    blank line before each expanded block, no blank between consecutive
+    one-liners (so a stack of healthy summaries packs tightly)."""
+    out: List[str] = []
+    prev_one = False
+    for b in blocks:
+        one = len(b) == 1
+        if not (prev_one and one):
+            out.append("")
+        out.extend(b)
+        prev_one = one
+    return out
+
+
 def render_table(instances: List[Instance], interval: float,
                  cost: Optional[CostConfig] = None) -> None:
     """Per-DP comparison table + aggregate row + imbalance check."""
@@ -1980,15 +2016,54 @@ def render_table(instances: List[Instance], interval: float,
         # separator before EXPANDED blocks (something failed and we want
         # visual breathing room), but consecutive single-line summaries pack
         # together without blanks to save vertical space on short terminals.
-        all_blocks = (_render_load_balance_sections(summaries)
-                      + _render_imbalance_sections(summaries))
-        prev_one_liner = False
-        for block in all_blocks:
-            is_one_liner = len(block) == 1
-            if not (prev_one_liner and is_one_liner):
-                lines.append("")
-            lines.extend(block)
-            prev_one_liner = is_one_liner
+        #
+        # When the terminal is too short to fit the full expanded form
+        # (along with Cost + Cumulative-hidden message + Recent events +
+        # footer), collapse expanded blocks to header-only summaries.
+        # Recent events still shows the alert detail for STICKY / SLOW
+        # signals, so the duplication is what we shed first.
+        all_blocks_full = (_render_load_balance_sections(summaries)
+                           + _render_imbalance_sections(summaries))
+        block_lines_full    = _blocks_as_lines(all_blocks_full)
+        block_lines_compact = _blocks_as_lines(_compact_alert_blocks(all_blocks_full))
+
+        try:
+            _term_h = shutil.get_terminal_size((100, 24)).lines
+        except (AttributeError, OSError):
+            _term_h = 24
+
+        # Rough projection of everything still to be appended after this
+        # point. Intentionally over-counts a little (assume Cumulative will
+        # be hidden, since fitting the full one is the easier case): the
+        # cost is small if we under-compact, but the cost of overflow is
+        # the title bar disappearing — so we lean conservative.
+        _ensure_event_log()
+        _n_events = min(5, len(EVENT_LOG)) if EVENT_LOG else 0
+        _events_h = (2 + _n_events) if _n_events > 0 else 0      # blank + header + N
+        _footer_h = 5                                            # blank + Legend + Runtime + Cost + shortcuts
+        _hidden_h = 3                                            # unconditional blank + blank + (Cumulative hidden line)
+        _first_sample_h = 0 if have_first_sample else 2          # blank + "throughput populating…"
+
+        _cost_h = 0
+        if cost is not None and cost.enabled:
+            if cost.compute_enabled and not cost.token_enabled:
+                _cost_h = 3                                      # blank + ▸ Cost (one-liner) + ✦ hint
+            else:
+                _cost_h = 2                                      # blank + ▸ Cost header
+                if cost.token_enabled:
+                    _cost_h += 4                                 # Token-based + Lifetime + Session + Current rate
+                if cost.compute_enabled:
+                    _cost_h += 4                                 # Compute-based + Burn + Lifetime + Session
+                if cost.token_enabled and cost.compute_enabled:
+                    _cost_h += 2                                 # Margin + At current load
+                elif cost.token_enabled != cost.compute_enabled:
+                    _cost_h += 1                                 # XOR hint
+
+        _projected = (len(lines) + len(block_lines_full)
+                      + _first_sample_h + _cost_h
+                      + _events_h + _footer_h + _hidden_h)
+        lines.extend(block_lines_full if _projected <= _term_h
+                     else block_lines_compact)
 
     if not have_first_sample:
         lines.append("")

@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4] — 2026-05-20
+
+### Fixed
+- **Expanded Load-balance / Imbalance-check blocks now collapse on short terminals.** 0.4.3 fixed the Cumulative-section projection, but on a 13" terminal with multiple active warnings (STICKY skew on one replica, SLOW TTFT on another) the expanded LB/IMB sections themselves (~4 lines each × 2 model groups) still pushed the title bar off the top of the viewport. When the projection shows the full form won't fit even with Cumulative hidden, expanded blocks now collapse back to their one-line header form (`▸ Load balance  ⚠ 2/3 failed  ↓ details in Recent events`). The detail isn't lost — every check that triggers expansion (`STICKY`, `SLOW TTFT`, `SLOW TPOT`) also records into the Recent events log, which stays rendered below. Net effect on a tight terminal: title bar + summary + the full table stay visible; LB/IMB shows the alert badge; Recent events provides the per-replica detail.
+
 ## [0.4.3] — 2026-05-20
 
 ### Fixed
