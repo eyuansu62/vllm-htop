@@ -61,7 +61,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "0.4.4"
+__version__ = "0.4.5"
 
 
 # ───────────────────────────── ANSI styling ──────────────────────────────
@@ -1552,6 +1552,7 @@ def _imbalance_check_for_group(
 
 def _render_imbalance_sections(
     summaries: List[Tuple[Instance, Optional[Dict[str, Any]]]],
+    combine_healthy: bool = True,
 ) -> List[List[str]]:
     """Yield one block of lines per model-group that has ≥2 ok replicas.
 
@@ -1560,6 +1561,12 @@ def _render_imbalance_sections(
     is healthy and there's more than one of them, the whole section
     collapses further into a single "✓ N model groups OK" summary —
     keeps short terminals readable.
+
+    `combine_healthy=False` disables that final collapse — callers use it
+    to keep the section's row count stable across frames when another
+    section in the same render already has warnings (otherwise this
+    section would flicker between "combined" and "separate" as it
+    transitions healthy ↔ degraded across polls).
     """
     by_model: Dict[Optional[str], List[Tuple[Instance, Dict[str, Any]]]] = {}
     for inst, s in summaries:
@@ -1598,7 +1605,7 @@ def _render_imbalance_sections(
             blocks.append(block)
 
     # All-healthy multi-group → one-liner summary
-    if all_healthy and len(blocks) > 1:
+    if combine_healthy and all_healthy and len(blocks) > 1:
         return [[f"{BOLD}▸ Imbalance check{RESET}  "
                  f"{GREEN}✓ all {len(blocks)} model groups OK{RESET}  "
                  f"{DIM}(× {total_replicas} replicas total){RESET}"]]
@@ -1727,11 +1734,15 @@ def _load_balance_check_for_group(
 
 def _render_load_balance_sections(
     summaries: List[Tuple[Instance, Optional[Dict[str, Any]]]],
+    combine_healthy: bool = True,
 ) -> List[List[str]]:
     """One ▸ Load balance block per model group (≥2 replicas).
 
     Same compaction rules as Imbalance check: healthy groups → one line,
     all-healthy multi-group → single section summary.
+
+    `combine_healthy=False` disables the multi-group collapse so the row
+    count stays stable when the sibling Imbalance section is degraded.
     """
     by_model: Dict[Optional[str], List[Tuple[Instance, Dict[str, Any]]]] = {}
     for inst, s in summaries:
@@ -1770,7 +1781,7 @@ def _render_load_balance_sections(
                 block.append(f"  {icon} {label:<20} {detail}")
             blocks.append(block)
 
-    if all_healthy and len(blocks) > 1:
+    if combine_healthy and all_healthy and len(blocks) > 1:
         return [[f"{BOLD}▸ Load balance{RESET}  "
                  f"{GREEN}✓ all {len(blocks)} model groups OK{RESET}  "
                  f"{DIM}(× {total_replicas} replicas total){RESET}"]]
@@ -2017,53 +2028,32 @@ def render_table(instances: List[Instance], interval: float,
         # visual breathing room), but consecutive single-line summaries pack
         # together without blanks to save vertical space on short terminals.
         #
-        # When the terminal is too short to fit the full expanded form
-        # (along with Cost + Cumulative-hidden message + Recent events +
-        # footer), collapse expanded blocks to header-only summaries.
-        # Recent events still shows the alert detail for STICKY / SLOW
-        # signals, so the duplication is what we shed first.
-        all_blocks_full = (_render_load_balance_sections(summaries)
-                           + _render_imbalance_sections(summaries))
-        block_lines_full    = _blocks_as_lines(all_blocks_full)
-        block_lines_compact = _blocks_as_lines(_compact_alert_blocks(all_blocks_full))
+        # Frame-to-frame stability rule: when ANY check fails anywhere in
+        # the deployment, the section pair switches to a fixed layout —
+        # one one-liner per (section × model group), with the
+        # within-section all-healthy multi-group collapse disabled. This
+        # is the only way to stop "header drift" between polls:
+        #   * each section deciding combine vs. separate independently
+        #     would flicker by 1 row when one section recovers while the
+        #     other still has warnings,
+        #   * an expanded block expanding/contracting by check count would
+        #     shift the rows below it.
+        # The Recent events log still records the bad detail for STICKY /
+        # SLOW alerts, so the duplicated in-place detail is the cheapest
+        # thing to drop. When the whole deployment is healthy, the
+        # multi-group collapse kicks back in for the most compact form.
+        lb_initial  = _render_load_balance_sections(summaries)
+        imb_initial = _render_imbalance_sections(summaries)
+        has_warning = any(len(b) > 1 for b in lb_initial + imb_initial)
 
-        try:
-            _term_h = shutil.get_terminal_size((100, 24)).lines
-        except (AttributeError, OSError):
-            _term_h = 24
+        if has_warning:
+            lb  = _render_load_balance_sections(summaries, combine_healthy=False)
+            imb = _render_imbalance_sections(summaries, combine_healthy=False)
+            all_blocks = _compact_alert_blocks(lb + imb)
+        else:
+            all_blocks = lb_initial + imb_initial
 
-        # Rough projection of everything still to be appended after this
-        # point. Intentionally over-counts a little (assume Cumulative will
-        # be hidden, since fitting the full one is the easier case): the
-        # cost is small if we under-compact, but the cost of overflow is
-        # the title bar disappearing — so we lean conservative.
-        _ensure_event_log()
-        _n_events = min(5, len(EVENT_LOG)) if EVENT_LOG else 0
-        _events_h = (2 + _n_events) if _n_events > 0 else 0      # blank + header + N
-        _footer_h = 5                                            # blank + Legend + Runtime + Cost + shortcuts
-        _hidden_h = 3                                            # unconditional blank + blank + (Cumulative hidden line)
-        _first_sample_h = 0 if have_first_sample else 2          # blank + "throughput populating…"
-
-        _cost_h = 0
-        if cost is not None and cost.enabled:
-            if cost.compute_enabled and not cost.token_enabled:
-                _cost_h = 3                                      # blank + ▸ Cost (one-liner) + ✦ hint
-            else:
-                _cost_h = 2                                      # blank + ▸ Cost header
-                if cost.token_enabled:
-                    _cost_h += 4                                 # Token-based + Lifetime + Session + Current rate
-                if cost.compute_enabled:
-                    _cost_h += 4                                 # Compute-based + Burn + Lifetime + Session
-                if cost.token_enabled and cost.compute_enabled:
-                    _cost_h += 2                                 # Margin + At current load
-                elif cost.token_enabled != cost.compute_enabled:
-                    _cost_h += 1                                 # XOR hint
-
-        _projected = (len(lines) + len(block_lines_full)
-                      + _first_sample_h + _cost_h
-                      + _events_h + _footer_h + _hidden_h)
-        lines.extend(block_lines_full if _projected <= _term_h
-                     else block_lines_compact)
+        lines.extend(_blocks_as_lines(all_blocks))
 
     if not have_first_sample:
         lines.append("")

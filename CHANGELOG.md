@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.5] — 2026-05-21
+
+### Fixed
+- **LB/IMB layout no longer drifts between polls.** 0.4.4 made the section heights threshold-dependent — once the projection sat near the terminal-height boundary, a single check's `bad` flag flipping (e.g. token-share crossing back under 1.5× median for one poll) would expand/compact the block and shift every row below it (Cost, Cumulative-hidden, Recent events, footer). Likewise, the within-section *all-healthy multi-group collapse* could fire on the Imbalance section while Load balance still had warnings, then unfire one poll later when Imbalance also degraded — another silent 1-row shift. **New rule**: as long as ANY check fails anywhere in the deployment, the section pair locks to a fixed layout — one one-liner per `(section × model group)`, with the multi-group collapse disabled in both sections. The detail you'd have seen expanded in-place is preserved in the Recent events log just below. When the whole deployment is healthy again, the compact 1-line-per-section collapse returns. Net effect: row positions for Cost / Cumulative-hidden / Recent events stay pinned across frames, no more visual jitter.
+
+### Removed
+- The 0.4.4 height-projection switch for LB/IMB expand vs. collapse. The new warning-aware stability rule subsumes it — expanded blocks are unconditionally compacted whenever any warning is active, which already takes the worst case down to one row per (section × group).
+
 ## [0.4.4] — 2026-05-20
 
 ### Fixed
