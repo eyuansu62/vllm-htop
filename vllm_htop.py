@@ -61,7 +61,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "0.4.5"
+__version__ = "0.4.6"
 
 
 # ───────────────────────────── ANSI styling ──────────────────────────────
@@ -1870,6 +1870,66 @@ def render_table(instances: List[Instance], interval: float,
     life_total = life_in_total + life_out_total
 
     kv_color = _kv_color(max_kv)
+
+    # Cluster-wide prefix-cache hit %. Weighted by query-rate across
+    # replicas — a busy replica with a 90% hit rate dominates over an
+    # idle one stuck at 0%, which matches how cache effectiveness
+    # actually affects throughput. Prefer the window value (fresh,
+    # tracks recent traffic); fall back to lifetime when the window
+    # hasn't accumulated data yet (e.g., first poll). None on
+    # deployments whose vLLM build doesn't expose prefix_cache_*
+    # metrics — the chunk is then omitted entirely.
+    _cache_q_win = _cache_h_win = 0.0
+    _cache_pct_life_vals: List[Tuple[float, float]] = []   # (lifetime%, weight)
+    _any_cache_metric = False
+    for inst, smry in summaries:
+        if smry is None:
+            continue
+        if smry.get("cache_hit_pct") is not None or smry.get("cache_hit_pct_life") is not None:
+            _any_cache_metric = True
+        prev = smry.get("_prev")
+        snap = smry.get("_snap")
+        dt = smry.get("_dt") or 0.0
+        if prev is not None and snap is not None and dt > 0:
+            qn = find_metric(snap.counters, "prefix_cache_queries")
+            hn = find_metric(snap.counters, "prefix_cache_hits")
+            if qn and qn in prev.counters:
+                _cache_q_win += max(0.0, snap.counters[qn] - prev.counters[qn])
+            if hn and hn in prev.counters:
+                _cache_h_win += max(0.0, snap.counters[hn] - prev.counters[hn])
+        # For lifetime fallback: weight by total queries (lifetime).
+        if snap is not None:
+            qn_l = find_metric(snap.counters, "prefix_cache_queries")
+            hn_l = find_metric(snap.counters, "prefix_cache_hits")
+            if qn_l and hn_l and snap.counters[qn_l] > 0:
+                _cache_pct_life_vals.append(
+                    (snap.counters[hn_l] / snap.counters[qn_l] * 100, snap.counters[qn_l])
+                )
+
+    agg_cache_win: Optional[float] = (
+        (_cache_h_win / _cache_q_win * 100) if _cache_q_win > 0 else None
+    )
+    agg_cache_life: Optional[float] = None
+    if _cache_pct_life_vals:
+        tot_w = sum(w for _, w in _cache_pct_life_vals)
+        if tot_w > 0:
+            agg_cache_life = sum(p * w for p, w in _cache_pct_life_vals) / tot_w
+    agg_cache = agg_cache_win if agg_cache_win is not None else agg_cache_life
+
+    cache_chunk = ""
+    if _any_cache_metric:
+        cc = _cache_color(agg_cache)
+        # Label "Cache" with the value; when only the lifetime fallback is
+        # available (no traffic this window), mark it dim with a "life"
+        # suffix so the user knows it's not the live rate.
+        if agg_cache_win is None and agg_cache_life is not None:
+            cache_chunk = (f"  {DIM}│{RESET}  "
+                           f"{DIM}Cache{RESET} {cc}{BOLD}{fmt(agg_cache, '{:.0f}'):>3}%{RESET}"
+                           f" {DIM}life{RESET}")
+        else:
+            cache_chunk = (f"  {DIM}│{RESET}  "
+                           f"{DIM}Cache{RESET} {cc}{BOLD}{fmt(agg_cache, '{:.0f}'):>3}%{RESET}")
+
     burn_chunk = ""
     if cost is not None and cost.compute_enabled:
         burn_chunk = (f"  {DIM}│{RESET}  "
@@ -1884,6 +1944,7 @@ def render_table(instances: List[Instance], interval: float,
         f"  {DIM}Wait{RESET} {fmt(sum_wait, '{:.0f}'):>3}"
         f"  {DIM}│{RESET}  {DIM}KV{RESET} {kv_color}{BOLD}{fmt(max_kv, '{:.1f}'):>5}%{RESET} "
         f"{kv_color}{mini_bar(max_kv)}{RESET}"
+        f"{cache_chunk}"
         f"{burn_chunk}"
         f"  {DIM}│{RESET}  {DIM}Lifetime{RESET} "
         f"{BOLD}{humanize(life_total)}{RESET} "

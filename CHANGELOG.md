@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.6] — 2026-05-21
+
+### Added
+- **Cluster-wide prefix-cache hit % in the summary header bar.** Previously the cache hit rate was only visible per replica (Cache% column) and as the table ALL-row aggregate. The headline summary bar (QPS / in / out / Run / Wait / KV / Burn / Lifetime) now also carries a `Cache xx%` chunk between KV and Burn, computed as the weighted aggregate across replicas (weights = per-replica query delta over the live window, so a busy replica's high hit rate dominates an idle one stuck at 0%). Color thresholds match the column (`_cache_color`): ≥60% green, ≥30% yellow, else red — higher is better, opposite of KV. When the live window hasn't accumulated samples yet, falls back to the lifetime weighted aggregate and tags it `life` so the dim suffix tells you it's not the live rate. The chunk is omitted entirely on deployments whose vLLM build doesn't expose `prefix_cache_queries_total` / `prefix_cache_hits_total`.
+
 ## [0.4.5] — 2026-05-21
 
 ### Fixed
