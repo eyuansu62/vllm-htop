@@ -9,7 +9,7 @@
 Zero dependencies. Single file. Python 3.8+.
 
 <p align="center">
-  <img src="docs/screenshot.svg" alt="vllm-htop terminal screenshot showing the DP table with per-engine rows, prefix cache hit rate column, imbalance check identifying the slow replica, and cost section with margin row" width="900">
+  <img src="docs/screenshot.svg" alt="vllm-htop terminal screenshot — at-a-glance summary bar (QPS / in / out / Run / Wait / KV fill / KV-Hit reuse rate / burn / lifetime tokens), per-engine table with Req% share and prefix-cache hit columns, a HOT replica flagged in red, stable Load-balance / Imbalance-check summaries with detail piped to the Recent events log (STICKY / SLOW / HOT / STALE), and a one-line compute Cost block" width="900">
 </p>
 
 ## At a glance

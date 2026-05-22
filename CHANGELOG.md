@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.4.7] — 2026-05-21
 
+### Docs
+- **Refreshed `docs/screenshot.svg`** (the README hero). The old version was from 0.3.0 and missed the summary header bar, `HOT` badge, `Req/s` + `Req%` columns, `KV-Hit%` column, stable Load-balance / Imbalance-check compact layout, one-line Cost summary, Recent events log, Runtime/Cost basis footer, and keyboard shortcuts. The new screenshot shows the full 0.4.7 layout including all of the above, plus a representative `HOT` replica with `STICKY` / `SLOW` / `HOT` / `STALE` entries in the Recent events log.
+
 ### Changed
 - **Renamed the prefix-cache hit-rate field from `Cache` to `KV-Hit`** in both the summary header bar and the table column (`Cache%` → `KV-Hit%`). The previous label sat right next to `KV` (KV cache fill %) and both used "cache" + "%", so the reader had to stop and think: one means "how full" (lower is better, the swap warning), the other means "how often was it reused" (higher is better, the throughput win). `KV-Hit` pairs explicitly with `KV` as the "fill vs hit" dual, and the direction-of-good is immediately readable. JSON keys are unchanged (`prefix_cache_hit_pct_window` / `prefix_cache_hit_pct_lifetime`) — the rename is purely visual.
 
