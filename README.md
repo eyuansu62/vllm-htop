@@ -9,7 +9,7 @@
 Zero dependencies. Single file. Python 3.8+.
 
 <p align="center">
-  <img src="docs/screenshot.svg" alt="vllm-htop terminal screenshot — at-a-glance summary bar (QPS / in / out / Run / Wait / KV fill / KV-Hit reuse rate / burn / lifetime tokens), per-engine table with Req% share and prefix-cache hit columns, a HOT replica flagged in red, stable Load-balance / Imbalance-check summaries with detail piped to the Recent events log (STICKY / SLOW / HOT / STALE), and a one-line compute Cost block" width="900">
+  <img src="docs/screenshot.png" alt="vllm-htop hero — vLLM Inference Dashboard with per-replica request rate, throughput, TTFT/TPOT P95, prefix hit rate, KV cache, GPU utilization and cost columns; imbalance check with severity badges; 5-minute trend sparklines for the key metrics; cost estimation per hour/day/30-day; top-talker endpoint breakdown; and a system panel with uptime + GPU memory" width="900">
 </p>
 
 ## At a glance
