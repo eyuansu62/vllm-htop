@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.9] — 2026-05-26
+
+### Changed
+- **Cumulative section is now a single cluster-wide line.** The old per-engine table needed `7 + N` rows (blank + header + rule + col header + rule + N engine rows + rule + ALL = ~14 rows for 8 engines), which made it nearly impossible to fit on a default 13" laptop terminal — the height-projection guard hid it almost every session and showed `(▸ Cumulative hidden — needs N more terminal rows)` instead. The new one-liner consolidates the genuinely Cumulative-only signal:
+  ```
+  ▸ Cumulative  life: 1.2M reqs · 366M in + 136M out  ·  peaks: Run 24 / Wait 6 / KV 91% / 70K/s in + 23K/s out
+  ```
+  Lifetime requests + tokens (in/out) on the left; cluster peak observations (Run, Wait, KV, in/out tok/s) on the right; `swap-seen` chip appended in red if any replica ever swapped during the session. The per-engine lifetime/peak breakdown is still in `--output json` for audit/log use cases — what the old in-terminal table showed per replica was largely already visible in the live table anyway. Net saving: ~12 rows on the user's 8-engine deployment, enough to make Cumulative visible by default on a 13" MacBook terminal for the first time.
+
+### Removed
+- Height-projection logic that decided whether to render the full Cumulative table vs. the "Cumulative hidden — needs N more rows" message. No longer needed — the one-liner always fits.
+
 ## [0.4.8] — 2026-05-26
 
 ### Fixed

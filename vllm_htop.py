@@ -61,7 +61,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "0.4.8"
+__version__ = "0.4.9"
 
 
 # ───────────────────────────── ANSI styling ──────────────────────────────
@@ -2251,64 +2251,42 @@ def render_table(instances: List[Instance], interval: float,
             elif cost.token_enabled and not cost.compute_enabled:
                 lines.append(f"  {DIM}✦ pass --gpu-cost-hour PRICE to also see compute cost and Margin{RESET}")
 
-    # ── Cumulative section ── (auto-hidden when terminal is too short)
+    # ── Cumulative summary ──
+    # One cluster-wide line: lifetime totals + peak observations. The
+    # earlier per-engine table (7+N rows) was almost always hidden by
+    # the height-projection guard on default-sized terminals, and the
+    # per-replica lifetime numbers it showed mostly duplicated the
+    # counters already growing in the main live table. Net unique
+    # value of the old table was "what's the cluster total + what's
+    # the worst we've seen so far" — both compress cleanly into one
+    # line. Auditors can still get per-engine breakdowns via
+    # `vllm-htop --output json`.
     if have_data:
-        try:
-            term_h = shutil.get_terminal_size((100, 24)).lines
-        except (AttributeError, OSError):
-            term_h = 24
-        # Project the full remaining output so we can decide whether
-        # Cumulative fits. Previously we under-counted (forgot events +
-        # the multi-line basis footer) and let Cumulative render even
-        # when total content would overflow the viewport — pushing the
-        # title bar off the top.
-        cumulative_h = 1 + 4 + len(instances) + 1   # blank + (header + rule + col header + rule) + rows + (rule + ALL)
-        _ensure_event_log()
-        # 0.4.8: Recent events always renders (header + at least a
-        # placeholder line) so the section can't pop in mid-session.
-        n_events = max(1, min(5, len(EVENT_LOG))) if EVENT_LOG is not None else 1
-        events_h = 2 + n_events                     # blank + header + N event lines (≥1)
-        footer_h = 5                                # blank + Legend + Runtime basis + Cost basis + shortcuts
-        projected = len(lines) + cumulative_h + events_h + footer_h
+        peak_run_max  = max((i.peak_running    for i in instances), default=0.0)
+        peak_wait_max = max((i.peak_waiting    for i in instances), default=0.0)
+        peak_kv_max   = max((i.peak_kv         for i in instances), default=0.0)
+        peak_pin_max  = max((i.peak_prompt_rps for i in instances), default=0.0)
+        peak_pout_max = max((i.peak_gen_rps    for i in instances), default=0.0)
+        any_swap      = any(i.peak_swapped > 0 for i in instances)
+        kv_color      = _kv_color(peak_kv_max)
+        swap_chunk    = f"  {RED}swap-seen{RESET}" if any_swap else ""
 
-        if projected <= term_h:
-            lines.append("")
-            lines.append(f"{BOLD}▸ Cumulative{RESET}  "
-                         f"{DIM}(life = vLLM counters · sess = peaks observed since monitor uptime {fmt_duration(uptime)}){RESET}")
-            lines.append(rule)
-            lines.append(f"{DIM} {'DP':<{name_w}}   life-Prompt  life-Output  life-Reqs   peak-Run  peak-Wait  peak-KV%   peak in/out tok/s{RESET}")
-            lines.append(rule)
-            for inst in instances:
-                s = inst.snapshot
-                if s is None:
-                    lines.append(f" {inst.name:<{name_w}} {GRAY}     —            —            —          —          —         —          — / —{RESET}")
-                    continue
-                def _c(frag: str) -> Optional[float]:
-                    nm = find_metric(s.counters, frag)
-                    return s.counters[nm] if nm else None
-                pin, pout, req = _c("prompt_tokens"), _c("generation_tokens"), _c("request_success")
-                swap_warn = RED if inst.peak_swapped > 0 else ""
-                kv_warn   = RED if inst.peak_kv > 90 else YELLOW if inst.peak_kv > 75 else ""
-                lines.append(
-                    f" {inst.name:<{name_w}}  "
-                    f"{humanize(pin):>10}  {humanize(pout):>10}  {humanize(req):>9}    "
-                    f"{inst.peak_running:>6.0f}     {inst.peak_waiting:>4.0f}    "
-                    f"{kv_warn}{inst.peak_kv:>5.1f}%{RESET}   "
-                    f"{humanize(inst.peak_prompt_rps):>5}/{humanize(inst.peak_gen_rps):<5}"
-                    + (f"  {swap_warn}swap-seen{RESET}" if inst.peak_swapped > 0 else "")
-                )
-            lines.append(rule)
-            lines.append(
-                f" {BOLD}ALL{RESET}{' ' * (name_w - 3)}  "
-                f"{BOLD}{humanize(sum_pin_life):>10}{RESET}  "
-                f"{BOLD}{humanize(sum_pout_life):>10}{RESET}  "
-                f"{BOLD}{humanize(sum_req_life):>9}{RESET}"
-            )
-        else:
-            lines.append("")
-            shortfall = projected - term_h
-            lines.append(f"{DIM}(▸ Cumulative hidden — needs {shortfall} more terminal rows; "
-                         f"resize, or run `vllm-htop --output json` for full data){RESET}")
+        lines.append("")
+        lines.append(
+            f"{BOLD}▸ Cumulative{RESET}  "
+            f"{DIM}life:{RESET} "
+            f"{BOLD}{humanize(sum_req_life)}{RESET} reqs  "
+            f"{DIM}·{RESET}  "
+            f"{BOLD}{humanize(sum_pin_life)}{RESET} in + "
+            f"{BOLD}{humanize(sum_pout_life)}{RESET} out  "
+            f"{DIM}·{RESET}  "
+            f"{DIM}peaks:{RESET} Run {BOLD}{peak_run_max:.0f}{RESET} / "
+            f"Wait {BOLD}{peak_wait_max:.0f}{RESET} / "
+            f"KV {kv_color}{BOLD}{peak_kv_max:.0f}%{RESET} / "
+            f"{BOLD}{humanize(peak_pin_max)}{RESET}{DIM}/s{RESET} in + "
+            f"{BOLD}{humanize(peak_pout_max)}{RESET}{DIM}/s{RESET} out"
+            f"{swap_chunk}"
+        )
 
     lines.append("")
     # Legend: one entry per URL. When the model is known, show it as the
