@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-05-26
+
+### Added
+- **Per-replica `Run-trend` sparkline column** at the end of the main table. Each row's 8-cell Unicode sparkline (`▁▂▃▄▅▆▇█`) shows the last 8 samples of `hist_running` with a pinned-zero floor, so a flat-zero replica looks flat at the bottom rather than confusingly mid-height. Makes "which replica's load is ramping?" a peripheral-vision question instead of a numbers-comparison one. DOWN rows show `────────` as placeholder.
+- **Inline health bar on Load-balance / Imbalance-check section headers.** A small 8-cell partial-fill bar next to the `(× N replicas)` annotation, colored by failure ratio (gray empty → healthy, yellow partial, red majority-failed). Visualizes the section's severity at a glance — the bar is wider/redder for worse situations, and stays width-stable so headers don't jiggle between healthy and degraded frames.
+- **Forward-looking `$/day` and `$/30d` chips in the compact Cost line.** Borrowed from the COST (EST.) panel in the dashboard mockup. Quick "what's this gonna cost over a sprint?" math without opening a calculator:
+  ```
+  ▸ Cost  ≈ $27.12/h  ·  $650.88/day  ·  $19,526.40/30d  (NVIDIA H100 80GB × 8 @ $3.39/h auto-detected)
+    spent $0.92 this session (2m11s)  ·  $54.24 lifetime (2h00m)  ·  ✦ pass --cost-in / --cost-out to add token cost
+  ```
+  The backward-looking session/lifetime spend moves to a second line to keep the forward-looking burn-rate row clean.
+
+### Changed
+- Main table rule line is 12 characters wider to accommodate the new `Run-trend` column.
+- Bumped minor version (0.4 → 0.5) to mark the visual upgrade — column addition is a user-visible layout change worth marking.
+
 ## [0.4.10] — 2026-05-26
 
 ### Added

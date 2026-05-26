@@ -61,7 +61,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "0.4.10"
+__version__ = "0.5.0"
 
 
 # ───────────────────────────── ANSI styling ──────────────────────────────
@@ -1149,6 +1149,24 @@ def mini_bar(pct: Optional[float], width: int = 8) -> str:
     return "▇" * filled + "░" * (width - filled)
 
 
+def _health_bar(n_bad: int, n_total: int, width: int = 8) -> str:
+    """Tiny inline severity bar for LB / IMB section headers.
+
+    Visualizes `n_bad / n_total` as a partial-fill block. Color tracks
+    the same threshold the headline text uses: green when all pass,
+    yellow on partial failure, red when majority failed. Empty bar
+    (all gray) signals "fully healthy" — keeps the column width
+    consistent with the warning case so headers don't jiggle.
+    """
+    if n_total <= 0:
+        return f"{GRAY}{'░' * width}{RESET}"
+    pct = n_bad / n_total
+    filled = int(round(pct * width))
+    color = RED if pct >= 0.66 else YELLOW if pct > 0 else GRAY
+    glyph = "▇" if pct > 0 else "░"
+    return f"{color}{glyph * filled}{GRAY}{'░' * (width - filled)}{RESET}"
+
+
 def bar(pct: Optional[float], width: int = 22) -> str:
     if pct is None:
         return " " * width
@@ -1656,10 +1674,11 @@ def _render_imbalance_sections(
         # the reader can scan section status in their peripheral vision
         # without parsing the right-side badge.
         glyph = f"{RED}●{RESET}" if n_bad > 0 else f"{GREEN}✓{RESET}"
+        bar = _health_bar(n_bad, n_checks)
         if multi_model and model:
-            head = f"{glyph} {BOLD}Imbalance check  {short_model_name(model)}{RESET}{suffix}"
+            head = f"{glyph} {BOLD}Imbalance check  {short_model_name(model)}{RESET}{suffix}  {bar}"
         else:
-            head = f"{glyph} {BOLD}Imbalance check{RESET}{suffix}"
+            head = f"{glyph} {BOLD}Imbalance check{RESET}{suffix}  {bar}"
 
         if n_bad == 0:
             blocks.append([f"{head}  {GREEN}✓ all {n_checks} checks pass{RESET}"])
@@ -1834,10 +1853,11 @@ def _render_load_balance_sections(
             all_healthy = False
         suffix = f"  {DIM}(× {len(group)} replicas){RESET}"
         glyph = f"{RED}●{RESET}" if n_bad > 0 else f"{GREEN}✓{RESET}"
+        bar = _health_bar(n_bad, n_checks)
         if multi_model and model:
-            head = f"{glyph} {BOLD}Load balance  {short_model_name(model)}{RESET}{suffix}"
+            head = f"{glyph} {BOLD}Load balance  {short_model_name(model)}{RESET}{suffix}  {bar}"
         else:
-            head = f"{glyph} {BOLD}Load balance{RESET}{suffix}"
+            head = f"{glyph} {BOLD}Load balance{RESET}{suffix}  {bar}"
 
         if n_bad == 0:
             blocks.append([f"{head}  {GREEN}✓ {n_checks} checks pass{RESET}"])
@@ -2033,8 +2053,16 @@ def render_table(instances: List[Instance], interval: float,
     )
     cache_hdr = f"  KV-Hit%" if show_cache else ""
     cache_pad = 9 if show_cache else 0
-    # +13 for the Req/s + Req% columns; +1 for the new left-bar gutter (0.4.10)
-    rule = GRAY + "─" * (86 + 13 + 1 + pad_extra + cache_pad) + RESET
+    # 0.5.0: trailing Run-trend column showing per-replica running-req
+    # history as an 8-cell Unicode sparkline. Borrowed visual treatment
+    # from the dashboard-mockup style (TRENDS panel) — within the
+    # constraints of a linear text layout, an inline column gets you
+    # most of the "live-feeling dashboard" benefit at zero extra rows.
+    trend_hdr = f"   Run-trend"   # 12 chars (3-sp + 9-char label)
+    trend_pad = 12
+    # +13 for the Req/s + Req% columns; +1 for the left-bar gutter (0.4.10);
+    # +trend_pad for the Run-trend sparkline column (0.5.0).
+    rule = GRAY + "─" * (86 + 13 + 1 + pad_extra + cache_pad + trend_pad) + RESET
     # Pre-compute totals for Req/s and Req% so each row knows its share.
     total_req_rps = sum((s["req_rps"] or 0) for _, s in summaries if s is not None)
 
@@ -2043,7 +2071,7 @@ def render_table(instances: List[Instance], interval: float,
     # ▌ for HOT/DOWN/STALE rows, blank otherwise — so problem replicas
     # jump out of the otherwise-uniform table. The column header has 2
     # leading spaces to preserve alignment.
-    lines.append(f"{DIM}  {'DP':<{name_w}}  Status   Run  Wait  Req/s  Req%  Swap   KV%{cache_hdr}      in tok/s  out tok/s   TTFT-P95  TPOT-P95{RESET}")
+    lines.append(f"{DIM}  {'DP':<{name_w}}  Status   Run  Wait  Req/s  Req%  Swap   KV%{cache_hdr}      in tok/s  out tok/s   TTFT-P95  TPOT-P95{trend_hdr}{RESET}")
     lines.append(rule)
 
     # Cluster-wide medians for HOT detection (compare each replica vs its peers).
@@ -2061,7 +2089,8 @@ def render_table(instances: List[Instance], interval: float,
             cache_dash = f"{GRAY}     —{RESET}" if show_cache else ""
             lines.append(f"{RED}▌{RESET} {inst.name:<{name_w}} {RED}DOWN  {RESET} "
                          f"{GRAY}  —     —    —    —     —      —{RESET}{cache_dash}"
-                         f"{GRAY}          —          —          —         —{RESET}  "
+                         f"{GRAY}          —          —          —         —{RESET}"
+                         f"   {GRAY}{'─' * 8}{RESET}  "
                          f"{DIM}{err}{RESET}")
             continue
         if smry.get("_prev") is not None:
@@ -2098,6 +2127,12 @@ def render_table(instances: List[Instance], interval: float,
             cc = _cache_color(cache_v)
             cache_cell = f"  {cc}{fmt(cache_v, '{:.0f}'):>4}%{RESET}"
 
+        # Run-trend sparkline: last 8 samples of hist_running, pinned to a
+        # floor of 0 so the bar reflects absolute level (a flat-zero replica
+        # shows as ▁▁▁▁▁▁▁▁ rather than confusingly-tall flat-mid bars).
+        trend_cell = (f"   {sparkline(inst.hist_running, width=8, fixed_min=0.0)}"
+                      if inst.hist_running else f"   {GRAY}{'─' * 8}{RESET}")
+
         lines.append(
             f"{row_bar} {inst.name:<{name_w}} {status} "
             f"{fmt(smry['running'], '{:.0f}'):>4}  "
@@ -2111,6 +2146,7 @@ def render_table(instances: List[Instance], interval: float,
             f"{fmt(smry['gen_rps'],    '{:.0f}'):>8}    "
             f"{fmt(ttft_ms, '{:.0f}'):>6}ms   "
             f"{fmt(tpot_ms, '{:.1f}'):>6}ms"
+            f"{trend_cell}"
         )
 
     ok_smries = [s for _, s in summaries if s is not None]
@@ -2250,21 +2286,31 @@ def render_table(instances: List[Instance], interval: float,
             src_suffix = " auto-detected" if cost.gpu_price_source == "auto" else ""
             model = cost.gpu_model or "GPU"
             vllm_up = vllm_uptime_seconds(instances)
+            # 0.5.0: forward-looking burn-rate chips (per-day, per-month)
+            # alongside the per-hour figure — borrowed from the COST (EST.)
+            # panel in the dashboard mockup. Useful for back-of-envelope
+            # "what's this run going to cost me?" sizing.
+            per_day   = cost.compute_per_hour * 24
+            per_month = cost.compute_per_hour * 24 * 30
+            day_chunk   = f"  {DIM}·{RESET}  {BOLD}{fmt_money(per_day,   cost.currency)}{RESET}{DIM}/day{RESET}"
+            month_chunk = f"  {DIM}·{RESET}  {BOLD}{fmt_money(per_month, cost.currency)}{RESET}{DIM}/30d{RESET}"
             life_chunk = ""
             if vllm_up is not None and vllm_up > 0:
                 life_chunk = (f"  {DIM}·{RESET}  "
-                              f"{BOLD}{fmt_money(cost.for_seconds(vllm_up), cost.currency)}{RESET} "
-                              f"lifetime {DIM}({fmt_duration(vllm_up)}){RESET}")
+                              f"spent {BOLD}{fmt_money(cost.for_seconds(vllm_up), cost.currency)}{RESET} "
+                              f"{DIM}lifetime ({fmt_duration(vllm_up)}){RESET}")
             lines.append(
                 f"{BOLD}▸ Cost{RESET}  "
-                f"≈ {BOLD}{fmt_money(cost.compute_per_hour, cost.currency)}/h{RESET} burn "
+                f"≈ {BOLD}{fmt_money(cost.compute_per_hour, cost.currency)}/h{RESET}"
+                f"{day_chunk}{month_chunk}  "
                 f"{DIM}({model} × {cost.num_gpus} @ {cost.currency}{cost.gpu_cost_hour:g}/h{src_suffix}){RESET}"
-                f"  {DIM}·{RESET}  "
-                f"{BOLD}{fmt_money(cost.for_seconds(uptime), cost.currency)}{RESET} "
-                f"this session {DIM}({fmt_duration(uptime)}){RESET}"
-                f"{life_chunk}"
             )
-            lines.append(f"  {DIM}✦ pass --cost-in PRICE --cost-out PRICE to add token cost and Margin{RESET}")
+            lines.append(
+                f"  spent {BOLD}{fmt_money(cost.for_seconds(uptime), cost.currency)}{RESET} "
+                f"{DIM}this session ({fmt_duration(uptime)}){RESET}"
+                f"{life_chunk}"
+                f"  {DIM}·{RESET}  {DIM}✦ pass --cost-in / --cost-out to add token cost{RESET}"
+            )
             # Skip the verbose block below; jump directly to Cumulative.
             # We do this by falling through with both token_enabled and
             # compute_enabled bypassed via the early `if compact_compute_only`
