@@ -61,7 +61,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "0.4.9"
+__version__ = "0.4.10"
 
 
 # ───────────────────────────── ANSI styling ──────────────────────────────
@@ -1225,6 +1225,64 @@ def _wait_color(w: Optional[float]) -> str:
     return RED if w > 5 else YELLOW
 
 
+def _build_verdict_line(
+    instances: List["Instance"],
+    summaries: List[Tuple["Instance", Optional[Dict[str, Any]]]],
+    has_lb_warning: bool,
+    has_imb_warning: bool,
+) -> str:
+    """One-line cluster verdict — the page's visual focus point.
+
+    Severity ladder, worst-first:
+      ● CRITICAL  any replica DOWN, or any HOT replica
+      ◆ DEGRADED  recent (60s) alert event, or LB/IMB has a failing check
+      ✓ HEALTHY   all replicas up + no warnings + no recent alerts
+
+    The detail half is intentionally specific (replica name + the
+    actual signal), not generic — at this prominence the reader
+    should learn *what* is wrong, not just that something is.
+    """
+    n_total = len(instances)
+    down_names = [inst.name for inst, smry in summaries if smry is None]
+
+    _ensure_event_log()
+    now = time.time()
+    recent_events = [e for e in EVENT_LOG if (now - e.timestamp) < 60.0]
+    hot_names = sorted({e.replica for e in recent_events
+                        if e.category == "HOT" and e.replica})
+    recent_alerts = [e for e in recent_events if e.severity == "alert"]
+
+    if down_names:
+        listed = ", ".join(down_names[:3])
+        more = f" (+{len(down_names)-3} more)" if len(down_names) > 3 else ""
+        return (f"{RED}● {BOLD}CRITICAL{RESET}  {DIM}—{RESET}  "
+                f"{len(down_names)}/{n_total} replicas DOWN: "
+                f"{RED}{listed}{more}{RESET}")
+
+    if hot_names:
+        listed = ", ".join(hot_names[:3])
+        more = f" (+{len(hot_names)-3} more)" if len(hot_names) > 3 else ""
+        return (f"{RED}● {BOLD}CRITICAL{RESET}  {DIM}—{RESET}  "
+                f"{len(hot_names)} HOT replica{'s' if len(hot_names) > 1 else ''}: "
+                f"{RED}{listed}{more}{RESET}")
+
+    if recent_alerts:
+        latest = recent_alerts[-1]
+        replica_str = f"{BOLD}{latest.replica}{RESET}" if latest.replica else "—"
+        return (f"{YELLOW}◆ {BOLD}DEGRADED{RESET}  {DIM}—{RESET}  "
+                f"{YELLOW}{latest.category}{RESET}: {replica_str} "
+                f"{DIM}—{RESET} {latest.message}")
+
+    if has_lb_warning or has_imb_warning:
+        which = "load-balance + imbalance" if (has_lb_warning and has_imb_warning) \
+                else ("load-balance" if has_lb_warning else "imbalance")
+        return (f"{YELLOW}◆ {BOLD}DEGRADED{RESET}  {DIM}—{RESET}  "
+                f"{which} check failing {DIM}— see section below{RESET}")
+
+    return (f"{GREEN}✓ {BOLD}HEALTHY{RESET}  {DIM}—{RESET}  "
+            f"{n_total}/{n_total} replicas up · no warnings · no recent alerts")
+
+
 def render_detail(inst: Instance, cost: Optional[CostConfig] = None) -> None:
     """Full detail view for a single instance (P50/P95/P99 × 4 latency metrics)."""
     s = inst.snapshot
@@ -1594,10 +1652,14 @@ def _render_imbalance_sections(
         if n_bad > 0:
             all_healthy = False
         suffix = f"  {DIM}(× {len(group)} replicas){RESET}"
+        # Section-header glyph encodes pass/fail at the left margin so
+        # the reader can scan section status in their peripheral vision
+        # without parsing the right-side badge.
+        glyph = f"{RED}●{RESET}" if n_bad > 0 else f"{GREEN}✓{RESET}"
         if multi_model and model:
-            head = f"{BOLD}▸ Imbalance check  {short_model_name(model)}{RESET}{suffix}"
+            head = f"{glyph} {BOLD}Imbalance check  {short_model_name(model)}{RESET}{suffix}"
         else:
-            head = f"{BOLD}▸ Imbalance check{RESET}{suffix}"
+            head = f"{glyph} {BOLD}Imbalance check{RESET}{suffix}"
 
         if n_bad == 0:
             blocks.append([f"{head}  {GREEN}✓ all {n_checks} checks pass{RESET}"])
@@ -1610,8 +1672,8 @@ def _render_imbalance_sections(
 
     # All-healthy multi-group → one-liner summary
     if combine_healthy and all_healthy and len(blocks) > 1:
-        return [[f"{BOLD}▸ Imbalance check{RESET}  "
-                 f"{GREEN}✓ all {len(blocks)} model groups OK{RESET}  "
+        return [[f"{GREEN}✓{RESET} {BOLD}Imbalance check{RESET}  "
+                 f"{GREEN}all {len(blocks)} model groups OK{RESET}  "
                  f"{DIM}(× {total_replicas} replicas total){RESET}"]]
     return blocks
 
@@ -1771,10 +1833,11 @@ def _render_load_balance_sections(
         if n_bad > 0:
             all_healthy = False
         suffix = f"  {DIM}(× {len(group)} replicas){RESET}"
+        glyph = f"{RED}●{RESET}" if n_bad > 0 else f"{GREEN}✓{RESET}"
         if multi_model and model:
-            head = f"{BOLD}▸ Load balance  {short_model_name(model)}{RESET}{suffix}"
+            head = f"{glyph} {BOLD}Load balance  {short_model_name(model)}{RESET}{suffix}"
         else:
-            head = f"{BOLD}▸ Load balance{RESET}{suffix}"
+            head = f"{glyph} {BOLD}Load balance{RESET}{suffix}"
 
         if n_bad == 0:
             blocks.append([f"{head}  {GREEN}✓ {n_checks} checks pass{RESET}"])
@@ -1786,8 +1849,8 @@ def _render_load_balance_sections(
             blocks.append(block)
 
     if combine_healthy and all_healthy and len(blocks) > 1:
-        return [[f"{BOLD}▸ Load balance{RESET}  "
-                 f"{GREEN}✓ all {len(blocks)} model groups OK{RESET}  "
+        return [[f"{GREEN}✓{RESET} {BOLD}Load balance{RESET}  "
+                 f"{GREEN}all {len(blocks)} model groups OK{RESET}  "
                  f"{DIM}(× {total_replicas} replicas total){RESET}"]]
     return blocks
 
@@ -1970,13 +2033,17 @@ def render_table(instances: List[Instance], interval: float,
     )
     cache_hdr = f"  KV-Hit%" if show_cache else ""
     cache_pad = 9 if show_cache else 0
-    # +13 for the two new columns (Req/s + Req%) inserted between Wait and Swap
-    rule = GRAY + "─" * (86 + 13 + pad_extra + cache_pad) + RESET
+    # +13 for the Req/s + Req% columns; +1 for the new left-bar gutter (0.4.10)
+    rule = GRAY + "─" * (86 + 13 + 1 + pad_extra + cache_pad) + RESET
     # Pre-compute totals for Req/s and Req% so each row knows its share.
     total_req_rps = sum((s["req_rps"] or 0) for _, s in summaries if s is not None)
 
     lines[-1] = rule  # replace the rule we appended earlier
-    lines.append(f"{DIM} {'DP':<{name_w}}  Status   Run  Wait  Req/s  Req%  Swap   KV%{cache_hdr}      in tok/s  out tok/s   TTFT-P95  TPOT-P95{RESET}")
+    # Leading 2 chars of every row are the "left-bar gutter" — a colored
+    # ▌ for HOT/DOWN/STALE rows, blank otherwise — so problem replicas
+    # jump out of the otherwise-uniform table. The column header has 2
+    # leading spaces to preserve alignment.
+    lines.append(f"{DIM}  {'DP':<{name_w}}  Status   Run  Wait  Req/s  Req%  Swap   KV%{cache_hdr}      in tok/s  out tok/s   TTFT-P95  TPOT-P95{RESET}")
     lines.append(rule)
 
     # Cluster-wide medians for HOT detection (compare each replica vs its peers).
@@ -1992,7 +2059,7 @@ def render_table(instances: List[Instance], interval: float,
         if smry is None:
             err = (inst.error or "no data yet")[:34]
             cache_dash = f"{GRAY}     —{RESET}" if show_cache else ""
-            lines.append(f" {inst.name:<{name_w}} {RED}DOWN  {RESET} "
+            lines.append(f"{RED}▌{RESET} {inst.name:<{name_w}} {RED}DOWN  {RESET} "
                          f"{GRAY}  —     —    —    —     —      —{RESET}{cache_dash}"
                          f"{GRAY}          —          —          —         —{RESET}  "
                          f"{DIM}{err}{RESET}")
@@ -2004,6 +2071,15 @@ def render_table(instances: List[Instance], interval: float,
         sc = RED if (smry["swapped"] or 0) > 0 else ""
         kc = _kv_color(smry["kv_pct"])
         status = _health_label(inst, smry, ttft_median_ms, tpot_median_ms)
+        # Left-bar gutter: red for HOT, yellow for STALE, blank otherwise.
+        # We match on the literal substrings _health_label embeds —
+        # cheap and stable since the label set is small and fixed.
+        if "HOT" in status:
+            row_bar = f"{RED}▌{RESET}"
+        elif "STALE" in status:
+            row_bar = f"{YELLOW}▌{RESET}"
+        else:
+            row_bar = " "
         ttft_ms = (smry["ttft_p95"] * 1000) if smry["ttft_p95"] is not None else None
         tpot_ms = (smry["tpot_p95"] * 1000) if smry["tpot_p95"] is not None else None
 
@@ -2023,7 +2099,7 @@ def render_table(instances: List[Instance], interval: float,
             cache_cell = f"  {cc}{fmt(cache_v, '{:.0f}'):>4}%{RESET}"
 
         lines.append(
-            f" {inst.name:<{name_w}} {status} "
+            f"{row_bar} {inst.name:<{name_w}} {status} "
             f"{fmt(smry['running'], '{:.0f}'):>4}  "
             f"{wc}{fmt(smry['waiting'], '{:.0f}'):>4}{RESET}  "
             f"{fmt(rps,     '{:.1f}'):>4}  "
@@ -2079,7 +2155,7 @@ def render_table(instances: List[Instance], interval: float,
 
         sum_req_rps = sum((s["req_rps"] or 0) for s in ok_smries)
         lines.append(
-            f" {BOLD}ALL{RESET}{' ' * (name_w - 3)}        "
+            f"  {BOLD}ALL{RESET}{' ' * (name_w - 3)}        "
             f" {sum_run:>4.0f}  "
             f"{sum_wait:>4.0f}  "
             f"{sum_req_rps:>4.1f}  "
@@ -2117,6 +2193,18 @@ def render_table(instances: List[Instance], interval: float,
         imb = _render_imbalance_sections(summaries, combine_healthy=False)
         all_blocks = _compact_alert_blocks(lb + imb)
         lines.extend(_blocks_as_lines(all_blocks))
+
+        # Cluster verdict line — the page's visual focus. We have all the
+        # signal we need at this point (DOWN replicas, HOT events,
+        # LB/IMB block warning state), so build the verdict and insert
+        # it right under the title (lines[1]) so it lands above the
+        # summary header bar without rerunning any of the computation.
+        _has_lb_warn  = any(len(b) > 1 for b in lb)
+        _has_imb_warn = any(len(b) > 1 for b in imb)
+        verdict_line  = _build_verdict_line(instances, summaries,
+                                            _has_lb_warn, _has_imb_warn)
+        # lines[0] = CLEAR; lines[1] = title. Verdict slots in at index 2.
+        lines.insert(2, verdict_line)
 
     if not have_first_sample:
         lines.append("")

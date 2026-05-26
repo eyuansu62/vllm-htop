@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.10] — 2026-05-26
+
+### Added
+- **Cluster verdict line** — the new visual focal point of the page. Renders directly under the title with a bold, color-coded severity badge and a one-sentence description of the worst thing currently happening:
+  - `● CRITICAL` (red) — any replica DOWN, or any HOT replica. Detail names the affected replica(s).
+  - `◆ DEGRADED` (yellow) — recent alert event (last 60s), or LB/IMB check failing. Detail cites the actual event (`STICKY: groupA.e0 — 33% req share for 27s`) so the reader learns *what* is wrong, not just that something is.
+  - `✓ HEALTHY` (green) — no warnings, no recent alerts.
+  Lets you answer "is anything wrong, and if so what?" in the first 2 seconds, instead of scanning every section.
+- **Section-header glyph encodes pass/fail state** on Load balance and Imbalance check headers. Green `✓` when the section passes, red `●` when any check failed. Replaces the neutral `▸` so section status is readable in the reader's peripheral vision without parsing the right-side `⚠ N/M failed` badge. Cost / Cumulative / Recent events keep the neutral `▸` since they have no pass/fail semantics.
+- **Problem-row left-bar gutter** in the main table — a red `▌` on HOT/DOWN rows and yellow `▌` on STALE rows. The column header carries a matching 2-space left margin so alignment stays clean for healthy rows. The bar is visible in peripheral vision and makes the "bad actor" replica trivially scannable in a long table.
+
+### Changed
+- Rule line under the table is 1 character wider to accommodate the new left-bar gutter. ALL-row prefix is 2 spaces instead of 1.
+
 ## [0.4.9] — 2026-05-26
 
 ### Changed
