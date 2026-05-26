@@ -61,7 +61,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-__version__ = "0.4.7"
+__version__ = "0.4.8"
 
 
 # ───────────────────────────── ANSI styling ──────────────────────────────
@@ -1076,11 +1076,15 @@ def record_event(category: str, replica: Optional[str], message: str,
 def render_event_log(max_lines: int = 5) -> List[str]:
     """Render the event log as a list of formatted lines, newest at the bottom.
 
-    Empty log → return [] (caller appends nothing — no wasted section header).
+    Always returns at least the section header — when the log is empty
+    we show a `(no events yet)` placeholder line. This stops the section
+    from materializing out of nowhere the moment a first event fires,
+    which would shift every row below it. 0.4.8 chose stability over
+    saving the 2 rows the empty placeholder costs.
     """
     _ensure_event_log()
     if not EVENT_LOG:
-        return []
+        return [f"{BOLD}▸ Recent events{RESET}  {DIM}(no events yet){RESET}"]
     events_to_show = list(EVENT_LOG)[-max_lines:]
     out = [f"{BOLD}▸ Recent events{RESET}  "
            f"{DIM}(last {len(events_to_show)} of {len(EVENT_LOG)}, deduped ~60s){RESET}"]
@@ -1921,16 +1925,15 @@ def render_table(instances: List[Instance], interval: float,
         cc = _cache_color(agg_cache)
         # Label "KV-Hit" — pairs with the adjacent "KV" (fill %) so the
         # reader sees "fill vs hit" rather than two ambiguous Cache fields.
-        # When only the lifetime fallback is available (no traffic this
-        # window), mark it dim with a "life" suffix so the user knows
-        # it's not the live rate.
-        if agg_cache_win is None and agg_cache_life is not None:
-            cache_chunk = (f"  {DIM}│{RESET}  "
-                           f"{DIM}KV-Hit{RESET} {cc}{BOLD}{fmt(agg_cache, '{:.0f}'):>3}%{RESET}"
-                           f" {DIM}life{RESET}")
-        else:
-            cache_chunk = (f"  {DIM}│{RESET}  "
-                           f"{DIM}KV-Hit{RESET} {cc}{BOLD}{fmt(agg_cache, '{:.0f}'):>3}%{RESET}")
+        # 0.4.8: fixed-width — no " life" suffix when falling back from
+        # window to lifetime. The 5-char suffix was making the summary
+        # bar shift sideways every time traffic ebbed for one poll.
+        # Lifetime is shown dimmer (no BOLD) instead, so the difference
+        # is still readable but the geometry stays put.
+        is_life = agg_cache_win is None and agg_cache_life is not None
+        emph = "" if is_life else BOLD
+        cache_chunk = (f"  {DIM}│{RESET}  "
+                       f"{DIM}KV-Hit{RESET} {cc}{emph}{fmt(agg_cache, '{:.0f}'):>3}%{RESET}")
 
     burn_chunk = ""
     if cost is not None and cost.compute_enabled:
@@ -2095,31 +2098,24 @@ def render_table(instances: List[Instance], interval: float,
         # visual breathing room), but consecutive single-line summaries pack
         # together without blanks to save vertical space on short terminals.
         #
-        # Frame-to-frame stability rule: when ANY check fails anywhere in
-        # the deployment, the section pair switches to a fixed layout —
-        # one one-liner per (section × model group), with the
-        # within-section all-healthy multi-group collapse disabled. This
-        # is the only way to stop "header drift" between polls:
-        #   * each section deciding combine vs. separate independently
-        #     would flicker by 1 row when one section recovers while the
-        #     other still has warnings,
-        #   * an expanded block expanding/contracting by check count would
-        #     shift the rows below it.
-        # The Recent events log still records the bad detail for STICKY /
-        # SLOW alerts, so the duplicated in-place detail is the cheapest
-        # thing to drop. When the whole deployment is healthy, the
-        # multi-group collapse kicks back in for the most compact form.
-        lb_initial  = _render_load_balance_sections(summaries)
-        imb_initial = _render_imbalance_sections(summaries)
-        has_warning = any(len(b) > 1 for b in lb_initial + imb_initial)
-
-        if has_warning:
-            lb  = _render_load_balance_sections(summaries, combine_healthy=False)
-            imb = _render_imbalance_sections(summaries, combine_healthy=False)
-            all_blocks = _compact_alert_blocks(lb + imb)
-        else:
-            all_blocks = lb_initial + imb_initial
-
+        # Deterministic layout (0.4.8): one line per (section × model
+        # group), no exceptions. Earlier versions tried to be clever:
+        #   * "combine all-healthy groups into one summary line" saved a
+        #     row when steady, but flipped 1 → N lines every time a
+        #     warning appeared / cleared between polls.
+        #   * "compact expanded blocks only when a warning is active"
+        #     saved rows during quiet windows, but expanded 1 → 4 lines
+        #     when warnings first fired.
+        # Both produced cross-frame drift — the section below would jump
+        # by 2–5 rows between polls and the viewer couldn't finish
+        # reading one frame before the next reshuffled it. 0.4.8 trades
+        # those rows for stability: the LB+IMB region is now N rows
+        # where N = sections × groups, regardless of warning state. Bad
+        # detail still flows to the Recent events log below for the
+        # per-replica context.
+        lb  = _render_load_balance_sections(summaries, combine_healthy=False)
+        imb = _render_imbalance_sections(summaries, combine_healthy=False)
+        all_blocks = _compact_alert_blocks(lb + imb)
         lines.extend(_blocks_as_lines(all_blocks))
 
     if not have_first_sample:
@@ -2268,8 +2264,10 @@ def render_table(instances: List[Instance], interval: float,
         # title bar off the top.
         cumulative_h = 1 + 4 + len(instances) + 1   # blank + (header + rule + col header + rule) + rows + (rule + ALL)
         _ensure_event_log()
-        n_events = min(5, len(EVENT_LOG)) if EVENT_LOG is not None else 0
-        events_h = (2 + n_events) if n_events > 0 else 0   # blank + header + N event lines
+        # 0.4.8: Recent events always renders (header + at least a
+        # placeholder line) so the section can't pop in mid-session.
+        n_events = max(1, min(5, len(EVENT_LOG))) if EVENT_LOG is not None else 1
+        events_h = 2 + n_events                     # blank + header + N event lines (≥1)
         footer_h = 5                                # blank + Legend + Runtime basis + Cost basis + shortcuts
         projected = len(lines) + cumulative_h + events_h + footer_h
 

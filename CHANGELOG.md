@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.8] — 2026-05-26
+
+### Fixed
+- **Eliminated remaining cross-frame layout drift.** 0.4.5 stabilized LB/IMB *while* warnings were active, but the transitions in/out of "all healthy" still made the layout jump:
+  - `▸ Load balance ✓ all N model groups OK` (one combined line) ↔ `▸ Load balance Group1 …` + `▸ Load balance Group2 …` (per-group lines) — 1 row of drift per section every time a warning appeared or cleared.
+  - `▸ Recent events` was hidden when the log was empty; the moment the first event fired, the section materialized and pushed everything below it down by 2–3 rows.
+  - `KV-Hit` in the summary header bar tagged the lifetime fallback with a 5-char ` life` suffix, shifting every chunk to its right whenever traffic ebbed for one poll.
+
+  0.4.8 makes the layout **deterministic** — same number of rows in every state. Concrete changes:
+  - LB/IMB unconditionally render one line per (section × model group). The multi-group all-healthy collapse is gone. Cost: 1 extra row per section when the deployment is fully healthy with N>1 model groups. Benefit: no row shift when warnings come and go.
+  - Recent events always renders. When the log is empty, the header shows `(no events yet)` as a 1-line placeholder. The section never appears or disappears mid-session.
+  - Cluster-aggregate `KV-Hit` in the summary bar drops the ` life` suffix. The lifetime fallback is signaled by losing the bold weight instead — same width, same column, no horizontal shift downstream.
+
+### Changed
+- Removed the within-section all-healthy multi-group collapse from `_render_load_balance_sections` / `_render_imbalance_sections`. The `combine_healthy` parameter still exists but the in-tree caller always passes `False`. (Internal — the parameter is not part of any documented API.)
+
 ## [0.4.7] — 2026-05-21
 
 ### Docs
